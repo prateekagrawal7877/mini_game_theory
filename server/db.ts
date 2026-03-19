@@ -24,6 +24,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
     participant_id TEXT,
+    experiment_id TEXT,
     run_type TEXT NOT NULL DEFAULT 'final',
     ab_group TEXT NOT NULL DEFAULT 'A',
     settings_json TEXT NOT NULL,
@@ -33,7 +34,19 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS participants (
     participant_id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
+    ab_group TEXT,
     final_completed_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS participant_experiments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    participant_id TEXT NOT NULL,
+    experiment_id TEXT NOT NULL,
+    final_completed_at TEXT,
+    final_session_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(participant_id, experiment_id),
+    FOREIGN KEY (participant_id) REFERENCES participants(participant_id)
   );
 
   CREATE TABLE IF NOT EXISTS pulls (
@@ -52,6 +65,8 @@ db.exec(`
     target_arm INTEGER NOT NULL,
     recalled_sequence_json TEXT NOT NULL,
     perceived_average REAL NOT NULL,
+    recalled_by_arm_json TEXT,
+    perceived_averages_json TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
   );
@@ -59,6 +74,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS memory_recall_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
+    arm_index INTEGER NOT NULL,
     position_index INTEGER NOT NULL,
     recalled_reward REAL NOT NULL,
     actual_reward REAL,
@@ -110,22 +126,82 @@ if (!sessionColumnNames.has('ab_group')) {
   db.exec("ALTER TABLE sessions ADD COLUMN ab_group TEXT NOT NULL DEFAULT 'A'")
 }
 
+if (!sessionColumnNames.has('experiment_id')) {
+  db.exec('ALTER TABLE sessions ADD COLUMN experiment_id TEXT')
+}
+
+const participantColumns = db
+  .prepare('PRAGMA table_info(participants)')
+  .all() as Array<{ name: string }>
+
+const participantColumnNames = new Set(participantColumns.map((column) => column.name))
+
+if (!participantColumnNames.has('ab_group')) {
+  db.exec('ALTER TABLE participants ADD COLUMN ab_group TEXT')
+}
+
+const questionnaireColumns = db
+  .prepare('PRAGMA table_info(questionnaires)')
+  .all() as Array<{ name: string }>
+
+const questionnaireColumnNames = new Set(questionnaireColumns.map((column) => column.name))
+
+if (!questionnaireColumnNames.has('recalled_by_arm_json')) {
+  db.exec('ALTER TABLE questionnaires ADD COLUMN recalled_by_arm_json TEXT')
+}
+
+if (!questionnaireColumnNames.has('perceived_averages_json')) {
+  db.exec('ALTER TABLE questionnaires ADD COLUMN perceived_averages_json TEXT')
+}
+
+const memoryRecallColumns = db
+  .prepare('PRAGMA table_info(memory_recall_items)')
+  .all() as Array<{ name: string }>
+
+const memoryRecallColumnNames = new Set(memoryRecallColumns.map((column) => column.name))
+
+if (!memoryRecallColumnNames.has('arm_index')) {
+  db.exec('ALTER TABLE memory_recall_items ADD COLUMN arm_index INTEGER NOT NULL DEFAULT 0')
+}
+
 const defaultExperimentConfig = {
   title: 'Bandit Decision-Making Study',
   purpose:
     'This study examines how people learn from rewards while making repeated decisions.',
   instructions:
-    'In each round, choose one arm. Rewards are either 0 or 1. Try to maximize your total reward. After the game, you must complete a short memory questionnaire before finishing.',
-  numArms: 2,
-  armProbabilities: [0.65, 0.35],
+    'In each round, choose one arm. Rewards are either 0 or 1. Try to maximize your total reward.',
+  maxFinalExperimentsPerParticipant: 1,
+  experiments: [
+    {
+      id: 'exp_1',
+      label: 'Experiment 1',
+      enabled: true,
+      numArms: 2,
+      armProbabilities: [0.65, 0.35],
+      finalRounds: 30,
+    },
+  ],
   practiceEnabled: true,
-  practiceRounds: 10,
-  finalRounds: 30,
+  practiceConfig: {
+    numArms: 2,
+    armProbabilities: [0.5, 0.5],
+    rounds: 10,
+  },
   abTestingEnabled: true,
   defaultVisibilityMode: 'last-3',
   groupConfigs: {
-    A: { visibilityMode: 'full' },
-    B: { visibilityMode: 'last-3' },
+    A: {
+      visibilityMode: 'full',
+      showRoundHistory: true,
+      showArmPullCounts: true,
+      showCurrentArmProbabilities: false,
+    },
+    B: {
+      visibilityMode: 'last-3',
+      showRoundHistory: false,
+      showArmPullCounts: true,
+      showCurrentArmProbabilities: false,
+    },
   },
 }
 

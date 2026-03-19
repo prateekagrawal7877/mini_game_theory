@@ -6,29 +6,58 @@ import crypto from 'node:crypto'
 type VisibilityMode = 'none' | 'last-3' | 'full' | 'summary'
 
 type SessionSettings = {
+  experimentId: string
+  experimentLabel: string
   numArms: number
   rounds: number
   visibilityMode: VisibilityMode
+  showRoundHistory: boolean
+  showArmPullCounts: boolean
+  showCurrentArmProbabilities: boolean
 }
 
 type ABGroup = 'A' | 'B'
 
 type RunType = 'practice' | 'final'
 
+type ExperimentDefinition = {
+  id: string
+  label: string
+  enabled: boolean
+  numArms: number
+  armProbabilities: number[]
+  finalRounds: number
+}
+
+type PracticeConfig = {
+  numArms: number
+  armProbabilities: number[]
+  rounds: number
+}
+
 type ExperimentConfig = {
   title: string
   purpose: string
   instructions: string
-  numArms: number
-  armProbabilities: number[]
+  maxFinalExperimentsPerParticipant: number
+  experiments: ExperimentDefinition[]
   practiceEnabled: boolean
-  practiceRounds: number
-  finalRounds: number
+  practiceConfig: PracticeConfig
   abTestingEnabled: boolean
   defaultVisibilityMode: VisibilityMode
   groupConfigs: {
-    A: { visibilityMode: VisibilityMode }
-    B: { visibilityMode: VisibilityMode }
+    A: {
+      visibilityMode: VisibilityMode
+      showRoundHistory: boolean
+      showArmPullCounts: boolean
+      showCurrentArmProbabilities: boolean
+    }
+    B: {
+      visibilityMode: VisibilityMode
+      showRoundHistory: boolean
+      showArmPullCounts: boolean
+      showCurrentArmProbabilities: boolean
+    }
   }
 }
 
@@ -41,11 +70,6 @@ type Pull = {
 type CompletionPayload = {
   runType: RunType
   pulls: Pull[]
-  questionnaire: {
-    targetArm: number
-    recalledSequence: number[]
-    perceivedAverage: number
-  }
   metrics: {
     totalReward: number
     averageReward: number
@@ -71,6 +95,7 @@ const insertSession = db.prepare(
       id,
       created_at,
       participant_id,
+      experiment_id,
       run_type,
       ab_group,
       settings_json,
@@ -79,6 +104,7 @@ const insertSession = db.prepare(
       @id,
       @created_at,
       @participant_id,
+      @experiment_id,
       @run_type,
       @ab_group,
       @settings_json,
@@ -89,11 +115,6 @@ const insertSession = db.prepare(
 const insertPull = db.prepare(
   `INSERT INTO pulls (session_id, round_index, arm_index, reward, created_at)
    VALUES (@session_id, @round_index, @arm_index, @reward, @created_at)`
-)
-
-const insertQuestionnaire = db.prepare(
-  `INSERT INTO questionnaires (session_id, target_arm, recalled_sequence_json, perceived_average, created_at)
-   VALUES (@session_id, @target_arm, @recalled_sequence_json, @perceived_average, @created_at)`
 )
 
 const insertMetrics = db.prepare(
@@ -122,26 +143,6 @@ const insertMetrics = db.prepare(
     )`
 )
 
-const insertMemoryRecallItem = db.prepare(
-  `INSERT INTO memory_recall_items (
-      session_id,
-      position_index,
-      recalled_reward,
-      actual_reward,
-      is_match,
-      recency_weight,
-      created_at
-    ) VALUES (
-      @session_id,
-      @position_index,
-      @recalled_reward,
-      @actual_reward,
-      @is_match,
-      @recency_weight,
-      @created_at
-    )`
-)
-
 const upsertSessionHistory = db.prepare(
   `INSERT INTO session_history (session_id, participant_id, snapshot_json, created_at)
    VALUES (@session_id, @participant_id, @snapshot_json, @created_at)
@@ -149,6 +150,25 @@ const upsertSessionHistory = db.prepare(
      participant_id = excluded.participant_id,
      snapshot_json = excluded.snapshot_json,
      created_at = excluded.created_at`
+)
+
+const upsertParticipantExperiment = db.prepare(
+  `INSERT INTO participant_experiments (
+      participant_id,
+      experiment_id,
+      final_completed_at,
+      final_session_id,
+      created_at
+    ) VALUES (
+      @participant_id,
+      @experiment_id,
+      @final_completed_at,
+      @final_session_id,
+      @created_at
+    )
+    ON CONFLICT(participant_id, experiment_id) DO UPDATE SET
+      final_completed_at = excluded.final_completed_at,
+      final_session_id = excluded.final_session_id`
 )
 
 function createId(prefix: string): string {
@@ -190,6 +210,50 @@ function normalizeArmProbabilities(raw: unknown, numArms: number): number[] {
   return parsed
 }
 
+function normalizeExperimentDefinitions(raw: unknown): ExperimentDefinition[] {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+
+  return raw
+    .map((value, index) => {
+      const candidate = value as Partial<ExperimentDefinition> & { [key: string]: unknown }
+      const numArmsRaw = Number(candidate.numArms ?? 2)
+      const numArms =
+        Number.isInteger(numArmsRaw) && numArmsRaw >= 2 && numArmsRaw <= 20 ? numArmsRaw : 2
+      const finalRoundsRaw = Number(candidate.finalRounds ?? 30)
+      const finalRounds =
+        Number.isInteger(finalRoundsRaw) && finalRoundsRaw >= 5 && finalRoundsRaw <= 500
+          ? finalRoundsRaw
+          : 30
+
+      return {
+        id: String(candidate.id ?? `exp_${index + 1}`).trim() || `exp_${index + 1}`,
+        label:
+          String(candidate.label ?? `Experiment ${index + 1}`).trim() || `Experiment ${index + 1}`,
+        enabled: Boolean(candidate.enabled ?? true),
+        numArms,
+        armProbabilities: normalizeArmProbabilities(candidate.armProbabilities, numArms),
+        finalRounds,
+      }
+    })
+    .filter((experiment) => experiment.id.length > 0)
+}
+
+function normalizePracticeConfig(raw: unknown): PracticeConfig {
+  const candidate = (raw ?? {}) as Partial<PracticeConfig> & { [key: string]: unknown }
+  const numArmsRaw = Number(candidate.numArms ?? 2)
+  const numArms = Number.isInteger(numArmsRaw) && numArmsRaw >= 2 && numArmsRaw <= 20 ? numArmsRaw : 2
+  const roundsRaw = Number(candidate.rounds ?? 10)
+  const rounds = Number.isInteger(roundsRaw) && roundsRaw >= 3 && roundsRaw <= 200 ? roundsRaw : 10
+
+  return {
+    numArms,
+    armProbabilities: normalizeArmProbabilities(candidate.armProbabilities, numArms),
+    rounds,
+  }
+}
+
 function getExperimentConfig(): ExperimentConfig {
   const row = db
     .prepare('SELECT config_json FROM experiment_config WHERE id = 1')
@@ -205,6 +269,18 @@ function getExperimentConfig(): ExperimentConfig {
 
   const numArms = Number(raw.numArms ?? 2)
   const normalizedNumArms = Number.isInteger(numArms) && numArms >= 2 && numArms <= 20 ? numArms : 2
+  const normalizedExperiments = normalizeExperimentDefinitions(raw.experiments)
+  const maxFinalRaw = Number(raw.maxFinalExperimentsPerParticipant ?? 1)
+  const maxFinalExperimentsPerParticipant =
+    Number.isInteger(maxFinalRaw) && maxFinalRaw >= 1 && maxFinalRaw <= 50 ? maxFinalRaw : 1
+  const fallbackExperiment: ExperimentDefinition = {
+    id: 'exp_1',
+    label: 'Experiment 1',
+    enabled: true,
+    numArms: normalizedNumArms,
+    armProbabilities: normalizeArmProbabilities(raw.armProbabilities, normalizedNumArms),
+    finalRounds: Number(raw.finalRounds ?? 30),
+  }
 
   return {
     title: String(raw.title ?? 'Bandit Decision-Making Study'),
@@ -214,19 +290,30 @@ function getExperimentConfig(): ExperimentConfig {
     ),
     instructions: String(
       raw.instructions ??
-        'In each round, choose one arm. Rewards are either 0 or 1. Try to maximize your total reward. After the game, you must complete a short memory questionnaire before finishing.'
+        'In each round, choose one arm. Rewards are either 0 or 1. Try to maximize your total reward.'
     ),
-    numArms: normalizedNumArms,
-    armProbabilities: normalizeArmProbabilities(raw.armProbabilities, normalizedNumArms),
+      maxFinalExperimentsPerParticipant,
+      experiments: normalizedExperiments.length > 0 ? normalizedExperiments : [fallbackExperiment],
     practiceEnabled: Boolean(raw.practiceEnabled ?? true),
-    practiceRounds: Number(raw.practiceRounds ?? 10),
-    finalRounds: Number(raw.finalRounds ?? 30),
+    practiceConfig: normalizePracticeConfig(raw.practiceConfig),
     abTestingEnabled: Boolean(raw.abTestingEnabled ?? true),
     defaultVisibilityMode: (raw.defaultVisibilityMode as VisibilityMode) ?? 'last-3',
     groupConfigs: {
-      A: { visibilityMode: (raw.groupConfigs?.A?.visibilityMode as VisibilityMode) ?? 'full' },
+      A: {
+        visibilityMode: (raw.groupConfigs?.A?.visibilityMode as VisibilityMode) ?? 'full',
+        showRoundHistory: Boolean(raw.groupConfigs?.A?.showRoundHistory ?? true),
+        showArmPullCounts: Boolean(raw.groupConfigs?.A?.showArmPullCounts ?? true),
+        showCurrentArmProbabilities: Boolean(
+          raw.groupConfigs?.A?.showCurrentArmProbabilities ?? false
+        ),
+      },
       B: {
         visibilityMode: (raw.groupConfigs?.B?.visibilityMode as VisibilityMode) ?? 'last-3',
+        showRoundHistory: Boolean(raw.groupConfigs?.B?.showRoundHistory ?? false),
+        showArmPullCounts: Boolean(raw.groupConfigs?.B?.showArmPullCounts ?? true),
+        showCurrentArmProbabilities: Boolean(
+          raw.groupConfigs?.B?.showCurrentArmProbabilities ?? false
+        ),
       },
     },
   }
@@ -239,12 +326,32 @@ function saveExperimentConfig(config: ExperimentConfig): void {
   )
 }
 
-function chooseGroup(config: ExperimentConfig): ABGroup {
+function secureRandom01(): number {
+  const value = crypto.randomBytes(4).readUInt32BE(0)
+  return value / 0x100000000
+}
+
+function chooseBalancedGroup(config: ExperimentConfig): ABGroup {
   if (!config.abTestingEnabled) {
     return 'A'
   }
 
-  return Math.random() < 0.5 ? 'A' : 'B'
+  const counts = db
+    .prepare(
+      `SELECT
+         SUM(CASE WHEN ab_group = 'A' THEN 1 ELSE 0 END) AS count_a,
+         SUM(CASE WHEN ab_group = 'B' THEN 1 ELSE 0 END) AS count_b
+       FROM participants`
+    )
+    .get() as { count_a: number | null; count_b: number | null }
+
+  const countA = Number(counts.count_a ?? 0)
+  const countB = Number(counts.count_b ?? 0)
+  const imbalance = countB - countA
+
+  // Keep assignment random, but bias toward the underrepresented group as imbalance grows.
+  const probabilityOfA = Math.min(0.85, Math.max(0.15, 0.5 + imbalance * 0.12))
+  return secureRandom01() < probabilityOfA ? 'A' : 'B'
 }
 
 function getVisibilityMode(config: ExperimentConfig, group: ABGroup): VisibilityMode {
@@ -269,24 +376,71 @@ function validateExperimentConfig(config: ExperimentConfig): string | null {
   if (!config.instructions?.trim()) {
     return 'instructions are required'
   }
-  if (!Number.isInteger(config.numArms) || config.numArms < 2 || config.numArms > 20) {
-    return 'numArms must be an integer between 2 and 20'
+  if (
+    !Number.isInteger(config.maxFinalExperimentsPerParticipant) ||
+    config.maxFinalExperimentsPerParticipant < 1 ||
+    config.maxFinalExperimentsPerParticipant > 50
+  ) {
+    return 'maxFinalExperimentsPerParticipant must be an integer between 1 and 50'
   }
-  if (!Array.isArray(config.armProbabilities) || config.armProbabilities.length !== config.numArms) {
-    return 'armProbabilities must contain exactly one value per arm'
+  if (!Array.isArray(config.experiments) || config.experiments.length === 0) {
+    return 'At least one experiment configuration is required'
+  }
+
+  const experimentIds = new Set<string>()
+  for (let i = 0; i < config.experiments.length; i += 1) {
+    const experiment = config.experiments[i]
+    const prefix = `experiments[${i}]`
+
+    if (!experiment.id?.trim()) {
+      return `${prefix}.id is required`
+    }
+    if (experimentIds.has(experiment.id)) {
+      return `Duplicate experiment id detected: ${experiment.id}`
+    }
+    experimentIds.add(experiment.id)
+
+    if (!experiment.label?.trim()) {
+      return `${prefix}.label is required`
+    }
+    if (!Number.isInteger(experiment.numArms) || experiment.numArms < 2 || experiment.numArms > 20) {
+      return `${prefix}.numArms must be an integer between 2 and 20`
+    }
+    if (
+      !Array.isArray(experiment.armProbabilities) ||
+      experiment.armProbabilities.length !== experiment.numArms
+    ) {
+      return `${prefix}.armProbabilities must contain exactly one value per arm`
+    }
+    if (
+      experiment.armProbabilities.some(
+        (value) => !Number.isFinite(value) || value < 0 || value > 1
+      )
+    ) {
+      return `${prefix}.armProbabilities values must be between 0 and 1`
+    }
+    if (!Number.isInteger(experiment.finalRounds) || experiment.finalRounds < 5 || experiment.finalRounds > 500) {
+      return `${prefix}.finalRounds must be an integer between 5 and 500`
+    }
+  }
+  if (!Number.isInteger(config.practiceConfig?.numArms) || config.practiceConfig.numArms < 2 || config.practiceConfig.numArms > 20) {
+    return 'practiceConfig.numArms must be an integer between 2 and 20'
   }
   if (
-    config.armProbabilities.some(
+    !Array.isArray(config.practiceConfig?.armProbabilities) ||
+    config.practiceConfig.armProbabilities.length !== config.practiceConfig.numArms
+  ) {
+    return 'practiceConfig.armProbabilities must contain exactly one value per arm'
+  }
+  if (
+    config.practiceConfig.armProbabilities.some(
       (value) => !Number.isFinite(value) || value < 0 || value > 1
     )
   ) {
-    return 'Each arm probability must be between 0 and 1'
+    return 'practiceConfig.armProbabilities values must be between 0 and 1'
   }
-  if (!Number.isInteger(config.practiceRounds) || config.practiceRounds < 3 || config.practiceRounds > 200) {
-    return 'practiceRounds must be an integer between 3 and 200'
-  }
-  if (!Number.isInteger(config.finalRounds) || config.finalRounds < 5 || config.finalRounds > 500) {
-    return 'finalRounds must be an integer between 5 and 500'
+  if (!Number.isInteger(config.practiceConfig?.rounds) || config.practiceConfig.rounds < 3 || config.practiceConfig.rounds > 200) {
+    return 'practiceConfig.rounds must be an integer between 3 and 200'
   }
   if (!validateVisibilityMode(config.defaultVisibilityMode)) {
     return 'defaultVisibilityMode must be one of none, last-3, full, summary'
@@ -296,6 +450,24 @@ function validateExperimentConfig(config: ExperimentConfig): string | null {
   }
   if (!validateVisibilityMode(config.groupConfigs?.B?.visibilityMode)) {
     return 'groupConfigs.B.visibilityMode must be valid'
+  }
+  if (typeof config.groupConfigs?.A?.showRoundHistory !== 'boolean') {
+    return 'groupConfigs.A.showRoundHistory must be boolean'
+  }
+  if (typeof config.groupConfigs?.B?.showRoundHistory !== 'boolean') {
+    return 'groupConfigs.B.showRoundHistory must be boolean'
+  }
+  if (typeof config.groupConfigs?.A?.showArmPullCounts !== 'boolean') {
+    return 'groupConfigs.A.showArmPullCounts must be boolean'
+  }
+  if (typeof config.groupConfigs?.B?.showArmPullCounts !== 'boolean') {
+    return 'groupConfigs.B.showArmPullCounts must be boolean'
+  }
+  if (typeof config.groupConfigs?.A?.showCurrentArmProbabilities !== 'boolean') {
+    return 'groupConfigs.A.showCurrentArmProbabilities must be boolean'
+  }
+  if (typeof config.groupConfigs?.B?.showCurrentArmProbabilities !== 'boolean') {
+    return 'groupConfigs.B.showCurrentArmProbabilities must be boolean'
   }
   return null
 }
@@ -315,8 +487,53 @@ function parseSessionSettings(sessionRow: { settings_json: string }): SessionSet
   return JSON.parse(sessionRow.settings_json) as SessionSettings
 }
 
+function pickExperiment(config: ExperimentConfig, experimentId: string): ExperimentDefinition | null {
+  const enabledExperiments = config.experiments.filter((experiment) => experiment.enabled)
+
+  if (enabledExperiments.length === 0) {
+    return null
+  }
+
+  const selected = enabledExperiments.find((experiment) => experiment.id === experimentId)
+  return selected ?? enabledExperiments[0]
+}
+
+function resolveParticipantGroup(config: ExperimentConfig, participantId: string): ABGroup {
+  const row = db
+    .prepare('SELECT participant_id, ab_group FROM participants WHERE participant_id = ?')
+    .get(participantId) as { participant_id: string; ab_group: string | null } | undefined
+
+  if (!row) {
+    const group = chooseBalancedGroup(config)
+    db.prepare(
+      'INSERT INTO participants (participant_id, created_at, ab_group, final_completed_at) VALUES (?, ?, ?, NULL)'
+    ).run(participantId, new Date().toISOString(), group)
+    return group
+  }
+
+  if (row.ab_group === 'A' || row.ab_group === 'B') {
+    return row.ab_group
+  }
+
+  const group = chooseBalancedGroup(config)
+  db.prepare('UPDATE participants SET ab_group = ? WHERE participant_id = ?').run(group, participantId)
+  return group
+}
+
 function deleteSessionData(sessionId: string): void {
   const deleteTransaction = db.transaction(() => {
+    const sessionMeta = db
+      .prepare('SELECT participant_id, experiment_id, run_type FROM sessions WHERE id = ?')
+      .get(sessionId) as
+      | { participant_id: string | null; experiment_id: string | null; run_type: RunType }
+      | undefined
+
+    if (sessionMeta?.run_type === 'final' && sessionMeta.participant_id && sessionMeta.experiment_id) {
+      db.prepare(
+        'DELETE FROM participant_experiments WHERE participant_id = ? AND experiment_id = ? AND final_session_id = ?'
+      ).run(sessionMeta.participant_id, sessionMeta.experiment_id, sessionId)
+    }
+
     db.prepare('DELETE FROM pulls WHERE session_id = ?').run(sessionId)
     db.prepare('DELETE FROM questionnaires WHERE session_id = ?').run(sessionId)
     db.prepare('DELETE FROM memory_recall_items WHERE session_id = ?').run(sessionId)
@@ -334,6 +551,84 @@ function normalizeParticipantId(input: unknown): string {
 
 function isValidParticipantId(participantId: string): boolean {
   return /^[A-Z0-9_-]{4,32}$/.test(participantId)
+}
+
+function escapeCsvCell(value: unknown): string {
+  const text = String(value ?? '')
+  if (text.includes(',') || text.includes('"') || text.includes('\n')) {
+    return `"${text.replace(/"/g, '""')}"`
+  }
+  return text
+}
+
+type ExportPullRow = {
+  session_id: string
+  session_created_at: string
+  participant_id: string | null
+  run_type: string
+  ab_group: string
+  experiment_id: string | null
+  settings_json: string
+  bandit_means_json: string
+  round_index: number
+  arm_index: number
+  reward: number
+  pull_created_at: string
+}
+
+function buildPullHistoryCsv(rows: ExportPullRow[]): string {
+  const headers = [
+    'session_id',
+    'session_created_at',
+    'participant_id',
+    'run_type',
+    'ab_group',
+    'experiment_id',
+    'experiment_label',
+    'num_arms',
+    'rounds',
+    'visibility_mode',
+    'show_round_history',
+    'show_arm_pull_counts',
+    'show_current_arm_probabilities',
+    'configured_arm_probabilities',
+    'pull_round_index',
+    'pull_arm_index',
+    'pull_reward',
+    'pull_created_at',
+  ]
+
+  const lines = [headers.join(',')]
+
+  for (const row of rows) {
+    const settings = JSON.parse(row.settings_json) as SessionSettings
+    const configuredArmProbabilities = JSON.parse(row.bandit_means_json) as number[]
+
+    const line = [
+      row.session_id,
+      row.session_created_at,
+      row.participant_id ?? '',
+      row.run_type,
+      row.ab_group,
+      row.experiment_id ?? '',
+      settings.experimentLabel,
+      settings.numArms,
+      settings.rounds,
+      settings.visibilityMode,
+      settings.showRoundHistory,
+      settings.showArmPullCounts,
+      settings.showCurrentArmProbabilities,
+      configuredArmProbabilities.join('|'),
+      row.round_index,
+      row.arm_index,
+      row.reward,
+      row.pull_created_at,
+    ].map(escapeCsvCell)
+
+    lines.push(line.join(','))
+  }
+
+  return lines.join('\n')
 }
 
 app.get('/api/health', (_req, res) => {
@@ -379,6 +674,7 @@ app.get('/api/admin/sessions', requireAdminToken, (_req, res) => {
          s.id,
          s.created_at,
          s.participant_id,
+         s.experiment_id,
          s.run_type,
          s.ab_group,
          m.total_reward,
@@ -394,6 +690,76 @@ app.get('/api/admin/sessions', requireAdminToken, (_req, res) => {
     .all() as Array<Record<string, unknown>>
 
   res.json({ rows })
+})
+
+app.get('/api/admin/export/group/:group', requireAdminToken, (req, res) => {
+  const group = String(req.params.group).toUpperCase()
+  if (group !== 'A' && group !== 'B') {
+    res.status(400).json({ error: 'group must be A or B' })
+    return
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT
+         s.id AS session_id,
+         s.created_at AS session_created_at,
+         s.participant_id,
+         s.run_type,
+         s.ab_group,
+         s.experiment_id,
+         s.settings_json,
+         s.bandit_means_json,
+         p.round_index,
+         p.arm_index,
+         p.reward,
+         p.created_at AS pull_created_at
+       FROM sessions s
+       INNER JOIN pulls p ON p.session_id = s.id
+       WHERE s.ab_group = ?
+       ORDER BY s.created_at ASC, p.round_index ASC`
+    )
+    .all(group) as ExportPullRow[]
+
+  const csv = buildPullHistoryCsv(rows)
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader('Content-Disposition', `attachment; filename="group_${group}_pull_history.csv"`)
+  res.send(csv)
+})
+
+app.get('/api/admin/export/experiment/:experimentId', requireAdminToken, (req, res) => {
+  const experimentId = String(req.params.experimentId)
+
+  const rows = db
+    .prepare(
+      `SELECT
+         s.id AS session_id,
+         s.created_at AS session_created_at,
+         s.participant_id,
+         s.run_type,
+         s.ab_group,
+         s.experiment_id,
+         s.settings_json,
+         s.bandit_means_json,
+         p.round_index,
+         p.arm_index,
+         p.reward,
+         p.created_at AS pull_created_at
+       FROM sessions s
+       INNER JOIN pulls p ON p.session_id = s.id
+       WHERE s.experiment_id = ?
+       ORDER BY s.created_at ASC, p.round_index ASC`
+    )
+    .all(experimentId) as ExportPullRow[]
+
+  const csv = buildPullHistoryCsv(rows)
+  const safeExperimentId = experimentId.replace(/[^a-zA-Z0-9_-]/g, '_')
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="experiment_${safeExperimentId}_pull_history.csv"`
+  )
+  res.send(csv)
 })
 
 app.delete('/api/admin/history/:sessionId', requireAdminToken, (req, res) => {
@@ -419,6 +785,7 @@ app.delete('/api/admin/history', requireAdminToken, (_req, res) => {
     db.prepare('DELETE FROM memory_recall_items').run()
     db.prepare('DELETE FROM metrics').run()
     db.prepare('DELETE FROM session_history').run()
+    db.prepare('DELETE FROM participant_experiments').run()
     db.prepare('DELETE FROM sessions').run()
     db.prepare('DELETE FROM participants').run()
   })
@@ -436,11 +803,27 @@ app.get('/api/participant/experiment', (_req, res) => {
     purpose: config.purpose,
     instructions: config.instructions,
     practiceEnabled: config.practiceEnabled,
+    practiceConfig: config.practiceConfig,
+    maxFinalExperimentsPerParticipant: config.maxFinalExperimentsPerParticipant,
+    experiments: config.experiments.filter((experiment) => experiment.enabled),
+    groupDisplayDefaults: {
+      A: {
+        showRoundHistory: config.groupConfigs.A.showRoundHistory,
+        showArmPullCounts: config.groupConfigs.A.showArmPullCounts,
+        showCurrentArmProbabilities: config.groupConfigs.A.showCurrentArmProbabilities,
+      },
+      B: {
+        showRoundHistory: config.groupConfigs.B.showRoundHistory,
+        showArmPullCounts: config.groupConfigs.B.showArmPullCounts,
+        showCurrentArmProbabilities: config.groupConfigs.B.showCurrentArmProbabilities,
+      },
+    },
   })
 })
 
 app.post('/api/sessions/start', (req, res) => {
   const participantId = normalizeParticipantId(req.body?.participantId)
+  const requestedExperimentId = String(req.body?.experimentId ?? '').trim()
   const requestedRunType = String(req.body?.runType ?? 'final')
   const runType: RunType = requestedRunType === 'practice' ? 'practice' : 'final'
 
@@ -460,20 +843,16 @@ app.post('/api/sessions/start', (req, res) => {
 
   const config = getExperimentConfig()
 
-  const participantRow = db
-    .prepare('SELECT participant_id, final_completed_at FROM participants WHERE participant_id = ?')
-    .get(participantId) as { participant_id: string; final_completed_at: string | null } | undefined
+  const selectedExperiment =
+    runType === 'practice' ? null : pickExperiment(config, requestedExperimentId)
 
-  if (!participantRow) {
-    db.prepare('INSERT INTO participants (participant_id, created_at, final_completed_at) VALUES (?, ?, NULL)').run(
-      participantId,
-      new Date().toISOString()
-    )
-  } else if (participantRow.final_completed_at) {
-    res.status(409).json({
-      error:
-        'This participant has already completed the final experiment and cannot participate again.',
-    })
+  if (runType === 'final' && !selectedExperiment) {
+    res.status(400).json({ error: 'No enabled experiments are available. Ask admin to enable one.' })
+    return
+  }
+
+  if (runType === 'final' && requestedExperimentId && selectedExperiment && selectedExperiment.id !== requestedExperimentId) {
+    res.status(400).json({ error: 'Selected experiment is not available for participation.' })
     return
   }
 
@@ -482,9 +861,42 @@ app.post('/api/sessions/start', (req, res) => {
     return
   }
 
-  const numArms = config.numArms
-  const rounds = runType === 'practice' ? config.practiceRounds : config.finalRounds
-  const abGroup = chooseGroup(config)
+  const abGroup = resolveParticipantGroup(config, participantId)
+
+  if (runType === 'final') {
+    const enabledExperimentCount = config.experiments.filter((experiment) => experiment.enabled).length
+    const effectiveFinalLimit = Math.max(config.maxFinalExperimentsPerParticipant, enabledExperimentCount)
+
+    const completedFinalCountRow = db
+      .prepare(
+        'SELECT COUNT(*) AS completed_count FROM participant_experiments WHERE participant_id = ? AND final_completed_at IS NOT NULL'
+      )
+      .get(participantId) as { completed_count: number }
+
+    if (completedFinalCountRow.completed_count >= effectiveFinalLimit) {
+      res.status(409).json({
+        error:
+          'This participant has reached the maximum allowed number of completed final experiments.',
+      })
+      return
+    }
+
+    const existingFinalForExperiment = db
+      .prepare(
+        'SELECT final_completed_at FROM participant_experiments WHERE participant_id = ? AND experiment_id = ?'
+      )
+      .get(participantId, selectedExperiment?.id) as { final_completed_at: string | null } | undefined
+
+    if (existingFinalForExperiment?.final_completed_at) {
+      res.status(409).json({
+        error: `Final run for ${selectedExperiment?.label ?? 'this experiment'} is already completed for this participant.`,
+      })
+      return
+    }
+  }
+
+  const numArms = runType === 'practice' ? config.practiceConfig.numArms : selectedExperiment?.numArms ?? 2
+  const rounds = runType === 'practice' ? config.practiceConfig.rounds : selectedExperiment?.finalRounds ?? 30
   const visibilityMode = getVisibilityMode(config, abGroup)
 
   if (!Number.isInteger(numArms) || numArms < 2 || numArms > 20) {
@@ -492,8 +904,10 @@ app.post('/api/sessions/start', (req, res) => {
     return
   }
 
-  if (!Number.isInteger(rounds) || rounds < 5 || rounds > 500) {
-    res.status(400).json({ error: 'rounds must be an integer between 5 and 500.' })
+  const minRounds = runType === 'practice' ? 3 : 5
+  const maxRounds = runType === 'practice' ? 200 : 500
+  if (!Number.isInteger(rounds) || rounds < minRounds || rounds > maxRounds) {
+    res.status(400).json({ error: `rounds must be an integer between ${minRounds} and ${maxRounds}.` })
     return
   }
 
@@ -502,7 +916,10 @@ app.post('/api/sessions/start', (req, res) => {
     return
   }
 
-  const configuredMeans = config.armProbabilities.map((value) => Number(value.toFixed(4)))
+  const configuredMeans =
+    runType === 'practice'
+      ? config.practiceConfig.armProbabilities.map((value) => Number(value.toFixed(4)))
+      : (selectedExperiment?.armProbabilities ?? []).map((value) => Number(value.toFixed(4)))
   const banditMeans =
     configuredMeans.length === numArms
       ? configuredMeans
@@ -510,12 +927,22 @@ app.post('/api/sessions/start', (req, res) => {
   const id = createId('session')
   const createdAt = new Date().toISOString()
 
-  const settings: SessionSettings = { numArms, rounds, visibilityMode }
+  const settings: SessionSettings = {
+    experimentId: runType === 'practice' ? 'practice' : selectedExperiment?.id ?? 'unknown',
+    experimentLabel: runType === 'practice' ? 'Practice Trial' : selectedExperiment?.label ?? 'Experiment',
+    numArms,
+    rounds,
+    visibilityMode,
+    showRoundHistory: config.groupConfigs[abGroup].showRoundHistory,
+    showArmPullCounts: config.groupConfigs[abGroup].showArmPullCounts,
+    showCurrentArmProbabilities: config.groupConfigs[abGroup].showCurrentArmProbabilities,
+  }
 
   insertSession.run({
     id,
     created_at: createdAt,
     participant_id: participantId,
+    experiment_id: runType === 'practice' ? 'practice' : selectedExperiment?.id ?? null,
     run_type: runType,
     ab_group: abGroup,
     settings_json: JSON.stringify(settings),
@@ -526,6 +953,10 @@ app.post('/api/sessions/start', (req, res) => {
     sessionId: id,
     settings,
     banditMeans,
+    experiment: {
+      id: runType === 'practice' ? 'practice' : selectedExperiment?.id ?? 'unknown',
+      label: runType === 'practice' ? 'Practice Trial' : selectedExperiment?.label ?? 'Experiment',
+    },
     runType,
     abGroup,
   })
@@ -536,16 +967,10 @@ app.post('/api/sessions/:sessionId/complete', (req, res) => {
   const payload = req.body as CompletionPayload
 
   const hasPulls = Array.isArray(payload?.pulls) && payload.pulls.length > 0
-  const hasQuestionnaire =
-    payload?.questionnaire &&
-    Number.isInteger(payload.questionnaire.targetArm) &&
-    Array.isArray(payload.questionnaire.recalledSequence) &&
-    Number.isFinite(payload.questionnaire.perceivedAverage)
-
   const hasMetrics = payload?.metrics && Number.isFinite(payload.metrics.totalReward)
 
-  if (!hasPulls || !hasQuestionnaire || !hasMetrics) {
-    res.status(400).json({ error: 'Missing pulls, questionnaire, or metrics payload.' })
+  if (!hasPulls || !hasMetrics) {
+    res.status(400).json({ error: 'Missing pulls or metrics payload.' })
     return
   }
 
@@ -559,9 +984,9 @@ app.post('/api/sessions/:sessionId/complete', (req, res) => {
   }
 
   const settingsRow = db
-    .prepare('SELECT settings_json, run_type, participant_id FROM sessions WHERE id = ?')
+    .prepare('SELECT settings_json, run_type, participant_id, experiment_id FROM sessions WHERE id = ?')
     .get(sessionId) as
-    | { settings_json: string; run_type: RunType; participant_id: string | null }
+    | { settings_json: string; run_type: RunType; participant_id: string | null; experiment_id: string | null }
     | undefined
 
   if (!settingsRow) {
@@ -582,10 +1007,6 @@ app.post('/api/sessions/:sessionId/complete', (req, res) => {
   }
 
   const now = new Date().toISOString()
-  const targetArmHistory = payload.pulls
-    .filter((pull) => pull.armIndex === payload.questionnaire.targetArm)
-    .map((pull) => pull.reward)
-    .reverse()
 
   const saveTransaction = db.transaction(() => {
     const deleteExisting = db.prepare('DELETE FROM pulls WHERE session_id = ?')
@@ -600,32 +1021,6 @@ app.post('/api/sessions/:sessionId/complete', (req, res) => {
         created_at: now,
       })
     }
-
-    db.prepare('DELETE FROM questionnaires WHERE session_id = ?').run(sessionId)
-    insertQuestionnaire.run({
-      session_id: sessionId,
-      target_arm: payload.questionnaire.targetArm,
-      recalled_sequence_json: JSON.stringify(payload.questionnaire.recalledSequence),
-      perceived_average: payload.questionnaire.perceivedAverage,
-      created_at: now,
-    })
-
-    db.prepare('DELETE FROM memory_recall_items WHERE session_id = ?').run(sessionId)
-    payload.questionnaire.recalledSequence.forEach((recalledReward, positionIndex) => {
-      const actualReward =
-        positionIndex < targetArmHistory.length ? targetArmHistory[positionIndex] : null
-      const isMatch = actualReward !== null && actualReward === recalledReward ? 1 : 0
-
-      insertMemoryRecallItem.run({
-        session_id: sessionId,
-        position_index: positionIndex,
-        recalled_reward: recalledReward,
-        actual_reward: actualReward,
-        is_match: isMatch,
-        recency_weight: 1 / (positionIndex + 1),
-        created_at: now,
-      })
-    })
 
     db.prepare('DELETE FROM metrics WHERE session_id = ?').run(sessionId)
     insertMetrics.run({
@@ -651,26 +1046,59 @@ app.post('/api/sessions/:sessionId/complete', (req, res) => {
         runType: settingsRow.run_type,
         settings,
         pulls: payload.pulls,
-        questionnaire: {
-          ...payload.questionnaire,
-          actualTargetArmSequence: targetArmHistory,
-        },
         metrics: payload.metrics,
       }),
       created_at: now,
     })
 
-    if (settingsRow.run_type === 'final' && settingsRow.participant_id) {
-      db.prepare('UPDATE participants SET final_completed_at = ? WHERE participant_id = ?').run(
-        now,
-        settingsRow.participant_id
-      )
+    if (settingsRow.run_type === 'final' && settingsRow.participant_id && settingsRow.experiment_id) {
+      upsertParticipantExperiment.run({
+        participant_id: settingsRow.participant_id,
+        experiment_id: settingsRow.experiment_id,
+        final_completed_at: now,
+        final_session_id: sessionId,
+        created_at: now,
+      })
+
+      db.prepare('UPDATE participants SET final_completed_at = ? WHERE participant_id = ?').run(now, settingsRow.participant_id)
     }
   })
 
   saveTransaction()
 
   res.json({ ok: true, sessionId })
+})
+
+app.post('/api/sessions/:sessionId/abort', (req, res) => {
+  const sessionId = String(req.params.sessionId)
+  const participantId = normalizeParticipantId(req.body?.participantId)
+
+  const sessionRow = db
+    .prepare('SELECT id, participant_id FROM sessions WHERE id = ?')
+    .get(sessionId) as { id: string; participant_id: string | null } | undefined
+
+  if (!sessionRow) {
+    res.status(404).json({ error: 'Session not found.' })
+    return
+  }
+
+  if (participantId && sessionRow.participant_id && sessionRow.participant_id !== participantId) {
+    res.status(403).json({ error: 'Session does not belong to this participant.' })
+    return
+  }
+
+  const metricsRow = db
+    .prepare('SELECT id FROM metrics WHERE session_id = ?')
+    .get(sessionId) as { id: number } | undefined
+
+  if (metricsRow) {
+    res.status(409).json({ error: 'Completed sessions cannot be aborted.' })
+    return
+  }
+
+  deleteSessionData(sessionId)
+
+  res.json({ ok: true, abortedSessionId: sessionId })
 })
 
 app.listen(port, () => {

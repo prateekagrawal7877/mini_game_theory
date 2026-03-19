@@ -9,7 +9,7 @@ type ParticipantStage =
   | 'loading'
   | 'intro'
   | 'play'
-  | 'questionnaire'
+  | 'between-experiments'
   | 'run-result'
   | 'final-complete'
 
@@ -30,21 +30,68 @@ type Metrics = {
   uniqueArmsChosen: number
 }
 
+type FinalExperimentSummary = {
+  experimentLabel: string
+  totalReward: number
+  averageReward: number
+  expectedRegret: number
+  uniqueArmsChosen: number
+}
+
+type ExperimentDefinition = {
+  id: string
+  label: string
+  enabled: boolean
+  numArms: number
+  armProbabilities: number[]
+  finalRounds: number
+}
+
+type PracticeConfig = {
+  numArms: number
+  armProbabilities: number[]
+  rounds: number
+}
+
 type ExperimentBrief = {
   title: string
   purpose: string
   instructions: string
   practiceEnabled: boolean
+  practiceConfig: PracticeConfig
+  maxFinalExperimentsPerParticipant: number
+  experiments: ExperimentDefinition[]
+  groupDisplayDefaults: {
+    A: {
+      showRoundHistory: boolean
+      showArmPullCounts: boolean
+      showCurrentArmProbabilities: boolean
+    }
+    B: {
+      showRoundHistory: boolean
+      showArmPullCounts: boolean
+      showCurrentArmProbabilities: boolean
+    }
+  }
 }
 
 type SessionStartResponse = {
   sessionId: string
   settings: {
+    experimentId: string
+    experimentLabel: string
     numArms: number
     rounds: number
     visibilityMode: VisibilityMode
+    showRoundHistory: boolean
+    showArmPullCounts: boolean
+    showCurrentArmProbabilities: boolean
   }
   banditMeans: number[]
+  experiment: {
+    id: string
+    label: string
+  }
   runType: RunType
   abGroup: ABGroup
 }
@@ -53,16 +100,25 @@ type ExperimentConfig = {
   title: string
   purpose: string
   instructions: string
-  numArms: number
-  armProbabilities: number[]
+  maxFinalExperimentsPerParticipant: number
+  experiments: ExperimentDefinition[]
   practiceEnabled: boolean
-  practiceRounds: number
-  finalRounds: number
+  practiceConfig: PracticeConfig
   abTestingEnabled: boolean
   defaultVisibilityMode: VisibilityMode
   groupConfigs: {
-    A: { visibilityMode: VisibilityMode }
-    B: { visibilityMode: VisibilityMode }
+    A: {
+      visibilityMode: VisibilityMode
+      showRoundHistory: boolean
+      showArmPullCounts: boolean
+      showCurrentArmProbabilities: boolean
+    }
+    B: {
+      visibilityMode: VisibilityMode
+      showRoundHistory: boolean
+      showArmPullCounts: boolean
+      showCurrentArmProbabilities: boolean
+    }
   }
 }
 
@@ -70,6 +126,7 @@ type AdminSessionRow = {
   id: string
   created_at: string
   participant_id: string | null
+  experiment_id: string | null
   run_type: string
   ab_group: string
   total_reward: number | null
@@ -79,44 +136,8 @@ type AdminSessionRow = {
   perceived_average_error: number | null
 }
 
-const visibilityLabels: Record<VisibilityMode, string> = {
-  none: 'No pull history visible',
-  'last-3': 'Only last 3 rewards per arm',
-  full: 'Full reward history per arm',
-  summary: 'Summary stats only (count/avg)',
-}
-
 function format(value: number): string {
   return value.toFixed(3)
-}
-
-function parseRecallInput(input: string): number[] {
-  return input
-    .split(/[\s,]+/)
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .map(Number)
-    .filter((value) => Number.isFinite(value))
-}
-
-function getMostPulledArmIndex(allPulls: Pull[], numArms: number): number {
-  const counts = new Array<number>(numArms).fill(0)
-  for (const pull of allPulls) {
-    if (pull.armIndex >= 0 && pull.armIndex < numArms) {
-      counts[pull.armIndex] += 1
-    }
-  }
-
-  let bestIndex = 0
-  let bestCount = counts[0] ?? 0
-  for (let i = 1; i < counts.length; i += 1) {
-    if (counts[i] > bestCount) {
-      bestCount = counts[i]
-      bestIndex = i
-    }
-  }
-
-  return bestIndex
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T | null> {
@@ -164,19 +185,25 @@ function App() {
   const [participantStage, setParticipantStage] = useState<ParticipantStage>('loading')
   const [experimentBrief, setExperimentBrief] = useState<ExperimentBrief | null>(null)
   const [participantId, setParticipantId] = useState<string>('')
+  const [activeParticipantId, setActiveParticipantId] = useState<string>('')
+  const [sequenceExperiments, setSequenceExperiments] = useState<ExperimentDefinition[]>([])
+  const [sequenceIndex, setSequenceIndex] = useState<number>(0)
+  const [pendingNextIndex, setPendingNextIndex] = useState<number | null>(null)
+  const [justCompletedExperimentLabel, setJustCompletedExperimentLabel] = useState<string>('')
+  const [sequenceRunType, setSequenceRunType] = useState<RunType>('final')
+  const [finalExperimentSummaries, setFinalExperimentSummaries] = useState<FinalExperimentSummary[]>([])
+  const [activeExperimentLabel, setActiveExperimentLabel] = useState<string>('')
 
   const [numArms, setNumArms] = useState<number>(2)
   const [rounds, setRounds] = useState<number>(0)
-  const [visibilityMode, setVisibilityMode] = useState<VisibilityMode>('last-3')
-  const [abGroup, setAbGroup] = useState<ABGroup>('A')
+  const [showRoundHistory, setShowRoundHistory] = useState<boolean>(false)
+  const [showArmPullCounts, setShowArmPullCounts] = useState<boolean>(false)
+  const [showCurrentArmProbabilities, setShowCurrentArmProbabilities] = useState<boolean>(false)
   const [runType, setRunType] = useState<RunType>('final')
 
   const [sessionId, setSessionId] = useState<string>('')
   const [banditMeans, setBanditMeans] = useState<number[]>([])
   const [pulls, setPulls] = useState<Pull[]>([])
-  const [questionTargetArm, setQuestionTargetArm] = useState<number>(0)
-  const [recalledSequenceInput, setRecalledSequenceInput] = useState<string>('')
-  const [perceivedAverageInput, setPerceivedAverageInput] = useState<string>('')
   const [metrics, setMetrics] = useState<Metrics | null>(null)
   const [error, setError] = useState<string>('')
   const [saving, setSaving] = useState<boolean>(false)
@@ -186,6 +213,8 @@ function App() {
   const [adminConfig, setAdminConfig] = useState<ExperimentConfig | null>(null)
   const [adminSessions, setAdminSessions] = useState<AdminSessionRow[]>([])
   const [adminMessage, setAdminMessage] = useState<string>('')
+  const [adminSaving, setAdminSaving] = useState<boolean>(false)
+  const [adminExporting, setAdminExporting] = useState<boolean>(false)
   const [pullInProgress, setPullInProgress] = useState<boolean>(false)
   const [activeArmIndex, setActiveArmIndex] = useState<number | null>(null)
   const [latestPullFeedback, setLatestPullFeedback] = useState<{
@@ -200,6 +229,33 @@ function App() {
   const currentRound = pulls.length
   const finished = currentRound >= rounds
   const totalRewardSoFar = useMemo(() => pulls.reduce((sum, pull) => sum + pull.reward, 0), [pulls])
+  const finalSummaryTotals = useMemo(() => {
+    if (finalExperimentSummaries.length === 0) {
+      return {
+        totalReward: 0,
+        meanAverageReward: 0,
+        totalExpectedRegret: 0,
+      }
+    }
+
+    const totalReward = finalExperimentSummaries.reduce(
+      (sum, row) => sum + row.totalReward,
+      0
+    )
+    const meanAverageReward =
+      finalExperimentSummaries.reduce((sum, row) => sum + row.averageReward, 0) /
+      finalExperimentSummaries.length
+    const totalExpectedRegret = finalExperimentSummaries.reduce(
+      (sum, row) => sum + row.expectedRegret,
+      0
+    )
+
+    return {
+      totalReward,
+      meanAverageReward,
+      totalExpectedRegret,
+    }
+  }, [finalExperimentSummaries])
 
   const pullsByArm = useMemo(() => {
     return Array.from({ length: numArms }, (_, armIndex) =>
@@ -207,18 +263,17 @@ function App() {
     )
   }, [numArms, pulls])
 
-  const visibleByArm = useMemo(() => {
-    return pullsByArm.map((armPulls) => {
-      const rewards = armPulls.map((pull) => pull.reward)
-      if (visibilityMode === 'none') {
-        return []
-      }
-      if (visibilityMode === 'last-3') {
-        return rewards.slice(-3)
-      }
-      return rewards
-    })
-  }, [pullsByArm, visibilityMode])
+  const estimatedProbabilityByArm = useMemo(
+    () =>
+      pullsByArm.map((armPulls) => {
+        if (armPulls.length === 0) {
+          return null
+        }
+        const rewardSum = armPulls.reduce((sum, pull) => sum + pull.reward, 0)
+        return rewardSum / armPulls.length
+      }),
+    [pullsByArm]
+  )
 
   useEffect(() => {
     async function loadExperimentBrief() {
@@ -316,11 +371,12 @@ function App() {
   }
 
   async function saveAdminConfig() {
-    if (!adminToken || !adminConfig) {
+    if (!adminToken || !adminConfig || adminSaving) {
       return
     }
 
     try {
+      setAdminSaving(true)
       setError('')
       setAdminMessage('')
       const response = await fetch('/api/admin/experiment', {
@@ -332,15 +388,20 @@ function App() {
         body: JSON.stringify({ config: adminConfig }),
       })
 
-      const data = await parseJsonResponse<{ error?: string }>(response)
+      const data = await parseJsonResponse<{ error?: string; config?: ExperimentConfig }>(response)
 
       if (!response.ok) {
         throw new Error(buildHttpErrorMessage(data, 'Failed to save experiment config', response))
       }
 
+      if (data?.config) {
+        setAdminConfig(data.config)
+      }
       setAdminMessage('Experiment configuration saved.')
     } catch (err) {
       setError(toUserErrorMessage(err, 'Failed to save config'))
+    } finally {
+      setAdminSaving(false)
     }
   }
 
@@ -382,7 +443,7 @@ function App() {
     }
 
     const confirmed = window.confirm(
-      'Delete ALL participant history data (sessions, pulls, questionnaire, memory details, metrics)? This cannot be undone.'
+      'Delete ALL participant history data (sessions, pulls, metrics)? This cannot be undone.'
     )
     if (!confirmed) {
       return
@@ -408,21 +469,77 @@ function App() {
     }
   }
 
-  async function startSession(nextRunType: RunType) {
+  async function downloadAdminCsv(endpoint: string, downloadName: string): Promise<void> {
+    if (!adminToken) {
+      throw new Error('Admin token missing')
+    }
+
+    const response = await fetch(endpoint, {
+      headers: { 'x-admin-token': adminToken },
+    })
+
+    if (!response.ok) {
+      const data = await parseJsonResponse<{ error?: string }>(response)
+      throw new Error(buildHttpErrorMessage(data, 'Failed to export CSV', response))
+    }
+
+    const blob = await response.blob()
+    const url = window.URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = downloadName
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.URL.revokeObjectURL(url)
+  }
+
+  async function exportFourConfiguredCsvs() {
+    if (!adminConfig || adminExporting) {
+      return
+    }
+
+    setAdminExporting(true)
+    setError('')
+    setAdminMessage('')
+
+    try {
+      const experiment1Id = adminConfig.experiments[0]?.id ?? 'exp_1'
+      const experiment2Id = adminConfig.experiments[1]?.id ?? 'exp_2'
+
+      await downloadAdminCsv('/api/admin/export/group/A', 'group_A_pull_history.csv')
+      await downloadAdminCsv('/api/admin/export/group/B', 'group_B_pull_history.csv')
+      await downloadAdminCsv(
+        `/api/admin/export/experiment/${encodeURIComponent(experiment1Id)}`,
+        `experiment_${experiment1Id}_pull_history.csv`
+      )
+      await downloadAdminCsv(
+        `/api/admin/export/experiment/${encodeURIComponent(experiment2Id)}`,
+        `experiment_${experiment2Id}_pull_history.csv`
+      )
+
+      setAdminMessage('Exported 4 CSV files: Group A, Group B, Experiment 1, Experiment 2.')
+    } catch (err) {
+      setError(toUserErrorMessage(err, 'Failed to export CSV files'))
+    } finally {
+      setAdminExporting(false)
+    }
+  }
+
+  async function startSingleSession(
+    nextRunType: RunType,
+    normalizedParticipantId: string,
+    experiment: ExperimentDefinition | null
+  ): Promise<boolean> {
     try {
       setError('')
-      const normalizedParticipantId = participantId.trim().toUpperCase()
-
-      if (!/^[A-Z0-9_-]{4,32}$/.test(normalizedParticipantId)) {
-        setError('Participant ID is required. Use 4-32 chars: letters, numbers, _ or -.')
-        return
-      }
 
       const response = await fetch('/api/sessions/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           participantId: normalizedParticipantId,
+          experimentId: experiment?.id,
           runType: nextRunType,
         }),
       })
@@ -440,25 +557,133 @@ function App() {
       setSessionId(data.sessionId)
       setNumArms(data.settings.numArms)
       setRounds(data.settings.rounds)
-      setVisibilityMode(data.settings.visibilityMode)
+      setShowRoundHistory(data.settings.showRoundHistory)
+      setShowArmPullCounts(data.settings.showArmPullCounts)
+      setShowCurrentArmProbabilities(data.settings.showCurrentArmProbabilities)
+      setActiveExperimentLabel(data.settings.experimentLabel)
       setBanditMeans(data.banditMeans)
       setRunType(data.runType)
-      setAbGroup(data.abGroup)
       setPulls([])
       setPullInProgress(false)
       setActiveArmIndex(null)
       setLatestPullFeedback(null)
-      setRecalledSequenceInput('')
-      setPerceivedAverageInput('')
       setMetrics(null)
       setParticipantStage('play')
+      return true
     } catch (err) {
       setError(toUserErrorMessage(err, 'Failed to start session'))
+      return false
     }
   }
 
+  async function startSession(nextRunType: RunType) {
+    const normalizedParticipantId = participantId.trim().toUpperCase()
+
+    if (!/^[A-Z0-9_-]{4,32}$/.test(normalizedParticipantId)) {
+      setError('Participant ID is required. Use 4-32 chars: letters, numbers, _ or -.')
+      return
+    }
+
+    setActiveParticipantId(normalizedParticipantId)
+    setSequenceRunType(nextRunType)
+    setPendingNextIndex(null)
+    setJustCompletedExperimentLabel('')
+
+    if (nextRunType === 'practice') {
+      setSequenceExperiments([])
+      setSequenceIndex(0)
+      setFinalExperimentSummaries([])
+      await startSingleSession('practice', normalizedParticipantId, null)
+      return
+    }
+
+    const enabledExperiments = (experimentBrief?.experiments ?? []).filter(
+      (experiment) => experiment.enabled
+    )
+
+    if (enabledExperiments.length === 0) {
+      setError('No enabled experiments are currently available.')
+      return
+    }
+
+    setSequenceExperiments(enabledExperiments)
+    setSequenceIndex(0)
+    setFinalExperimentSummaries([])
+
+    await startSingleSession('final', normalizedParticipantId, enabledExperiments[0])
+  }
+
+  async function continueToNextExperiment() {
+    if (pendingNextIndex === null || !activeParticipantId) {
+      return
+    }
+
+    const nextExperiment = sequenceExperiments[pendingNextIndex]
+    if (!nextExperiment) {
+      return
+    }
+
+    const targetIndex = pendingNextIndex
+    const started = await startSingleSession('final', activeParticipantId, nextExperiment)
+    if (!started) {
+      return
+    }
+
+    setPendingNextIndex(null)
+    setJustCompletedExperimentLabel('')
+    setSequenceIndex(targetIndex)
+  }
+
+  function clearPendingTimers() {
+    if (pullTimerRef.current !== null) {
+      window.clearTimeout(pullTimerRef.current)
+      pullTimerRef.current = null
+    }
+    if (transitionTimerRef.current !== null) {
+      window.clearTimeout(transitionTimerRef.current)
+      transitionTimerRef.current = null
+    }
+  }
+
+  async function exitCurrentTrial() {
+    const confirmed = window.confirm(
+      'Exit current trial? Progress for this trial will be discarded and not saved.'
+    )
+    if (!confirmed) {
+      return
+    }
+
+    clearPendingTimers()
+    setPullInProgress(false)
+    setActiveArmIndex(null)
+    setLatestPullFeedback(null)
+
+    if (sessionId) {
+      try {
+        const response = await fetch(`/api/sessions/${sessionId}/abort`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            participantId: activeParticipantId || participantId.trim().toUpperCase(),
+          }),
+        })
+
+        const data = await parseJsonResponse<{ error?: string }>(response)
+        if (!response.ok) {
+          throw new Error(buildHttpErrorMessage(data, 'Failed to exit current trial', response))
+        }
+      } catch (err) {
+        setError(toUserErrorMessage(err, 'Failed to exit current trial'))
+        return
+      }
+    }
+
+    reset()
+    setError('Trial exited. Progress was discarded and not saved.')
+  }
+
   function pullArm(armIndex: number) {
-    if (finished || participantStage !== 'play' || pullInProgress) {
+    if (finished || participantStage !== 'play' || pullInProgress || saving) {
       return
     }
 
@@ -485,23 +710,24 @@ function App() {
         reward,
         roundNumber: nextRoundNumber,
       })
-      setPullInProgress(false)
       setActiveArmIndex(null)
 
       if (nextPulls.length >= rounds) {
+        // Keep pull lock active while finalizing to prevent overshooting configured rounds.
+        setPullInProgress(true)
         transitionTimerRef.current = window.setTimeout(() => {
-          const targetArm = getMostPulledArmIndex(nextPulls, numArms)
-          setQuestionTargetArm(targetArm)
-          setParticipantStage('questionnaire')
+          void completeSession(nextPulls)
           setLatestPullFeedback(null)
         }, ROUND_TRANSITION_MS)
+      } else {
+        setPullInProgress(false)
       }
     }, PULL_REVEAL_MS)
   }
 
-  function computeMetrics(recalledSequence: number[], perceivedAverage: number): Metrics {
-    const totalReward = pulls.reduce((sum, pull) => sum + pull.reward, 0)
-    const averageReward = pulls.length > 0 ? totalReward / pulls.length : 0
+  function computeMetrics(sessionPulls: Pull[]): Metrics {
+    const totalReward = sessionPulls.reduce((sum, pull) => sum + pull.reward, 0)
+    const averageReward = sessionPulls.length > 0 ? totalReward / sessionPulls.length : 0
 
     let bestArmIndex = 0
     let bestArmMean = banditMeans[0] ?? 0
@@ -512,39 +738,13 @@ function App() {
       }
     }
 
-    const expectedCollected = pulls.reduce(
+    const expectedCollected = sessionPulls.reduce(
       (sum, pull) => sum + (banditMeans[pull.armIndex] ?? 0),
       0
     )
     const expectedRegret = rounds * bestArmMean - expectedCollected
 
-    const targetArmHistory = pulls
-      .filter((pull) => pull.armIndex === questionTargetArm)
-      .map((pull) => pull.reward)
-      .reverse()
-
-    const compareLength = Math.min(targetArmHistory.length, recalledSequence.length)
-    let weightedCorrect = 0
-    let weightTotal = 0
-    for (let i = 0; i < compareLength; i += 1) {
-      const weight = 1 / (i + 1)
-      if (targetArmHistory[i] === recalledSequence[i]) {
-        weightedCorrect += weight
-      }
-      weightTotal += weight
-    }
-
-    const recencyWeightedAccuracy = weightTotal > 0 ? weightedCorrect / weightTotal : null
-    const actualTargetAverage =
-      targetArmHistory.length > 0
-        ? targetArmHistory.reduce((sum, reward) => sum + reward, 0) / targetArmHistory.length
-        : 0
-
-    const perceivedAverageError = Number.isFinite(perceivedAverage)
-      ? Math.abs(perceivedAverage - actualTargetAverage)
-      : null
-
-    const uniqueArmsChosen = new Set(pulls.map((pull) => pull.armIndex)).size
+    const uniqueArmsChosen = new Set(sessionPulls.map((pull) => pull.armIndex)).size
 
     return {
       totalReward,
@@ -552,30 +752,17 @@ function App() {
       bestArmIndex,
       bestArmMean,
       expectedRegret,
-      recencyWeightedAccuracy,
-      perceivedAverageError,
+      recencyWeightedAccuracy: null,
+      perceivedAverageError: null,
       uniqueArmsChosen,
     }
   }
 
-  async function submitQuestionnaire() {
-    const recalledSequence = parseRecallInput(recalledSequenceInput)
-    const perceivedAverage = Number(perceivedAverageInput)
-
-    if (recalledSequence.length === 0) {
-      setError('Please enter at least one remembered reward value.')
-      return
-    }
-
-    if (!Number.isFinite(perceivedAverage)) {
-      setError('Please enter a valid number for perceived average reward.')
-      return
-    }
-
+  async function completeSession(sessionPulls: Pull[]) {
     setSaving(true)
     setError('')
 
-    const nextMetrics = computeMetrics(recalledSequence, perceivedAverage)
+    const nextMetrics = computeMetrics(sessionPulls)
 
     try {
       const response = await fetch(`/api/sessions/${sessionId}/complete`, {
@@ -583,12 +770,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           runType,
-          pulls,
-          questionnaire: {
-            targetArm: questionTargetArm,
-            recalledSequence,
-            perceivedAverage,
-          },
+          pulls: sessionPulls,
           metrics: nextMetrics,
         }),
       })
@@ -600,13 +782,36 @@ function App() {
       }
 
       setMetrics(nextMetrics)
+      setPullInProgress(false)
 
-      if (runType === 'practice') {
+      if (sequenceRunType === 'final') {
+        setFinalExperimentSummaries((prev) => [
+          ...prev,
+          {
+            experimentLabel: activeExperimentLabel || `Experiment ${sequenceIndex + 1}`,
+            totalReward: nextMetrics.totalReward,
+            averageReward: nextMetrics.averageReward,
+            expectedRegret: nextMetrics.expectedRegret,
+            uniqueArmsChosen: nextMetrics.uniqueArmsChosen,
+          },
+        ])
+      }
+
+      const hasSequence = sequenceExperiments.length > 0
+      const isLastExperiment = !hasSequence || sequenceIndex >= sequenceExperiments.length - 1
+
+      if (!isLastExperiment && activeParticipantId) {
+        const nextIndex = sequenceIndex + 1
+        setPendingNextIndex(nextIndex)
+        setJustCompletedExperimentLabel(activeExperimentLabel || `Experiment ${sequenceIndex + 1}`)
+        setParticipantStage('between-experiments')
+      } else if (sequenceRunType === 'practice') {
         setParticipantStage('run-result')
       } else {
         setParticipantStage('final-complete')
       }
     } catch (err) {
+      setPullInProgress(false)
       setError(toUserErrorMessage(err, 'Failed to complete session'))
     } finally {
       setSaving(false)
@@ -614,14 +819,20 @@ function App() {
   }
 
   function reset() {
+    clearPendingTimers()
     setParticipantStage('intro')
     setPulls([])
     setBanditMeans([])
     setSessionId('')
     setMetrics(null)
-    setRecalledSequenceInput('')
-    setPerceivedAverageInput('')
     setRounds(0)
+    setSequenceExperiments([])
+    setSequenceIndex(0)
+    setPendingNextIndex(null)
+    setJustCompletedExperimentLabel('')
+    setFinalExperimentSummaries([])
+    setActiveExperimentLabel('')
+    setActiveParticipantId('')
     setPullInProgress(false)
     setActiveArmIndex(null)
     setLatestPullFeedback(null)
@@ -644,36 +855,155 @@ function App() {
       ...adminConfig,
       groupConfigs: {
         ...adminConfig.groupConfigs,
-        [group]: { visibilityMode: value },
+        [group]: {
+          ...adminConfig.groupConfigs[group],
+          visibilityMode: value,
+        },
       },
     })
   }
 
-  function updateNumArmsWithProbabilities(nextNumArms: number) {
+  function updateGroupDetailToggle(
+    group: ABGroup,
+    key: 'showRoundHistory' | 'showArmPullCounts' | 'showCurrentArmProbabilities',
+    value: boolean
+  ) {
+    if (!adminConfig) {
+      return
+    }
+
+    setAdminConfig({
+      ...adminConfig,
+      groupConfigs: {
+        ...adminConfig.groupConfigs,
+        [group]: {
+          ...adminConfig.groupConfigs[group],
+          [key]: value,
+        },
+      },
+    })
+  }
+
+  function updateExperimentField<K extends keyof ExperimentDefinition>(
+    experimentIndex: number,
+    key: K,
+    value: ExperimentDefinition[K]
+  ) {
+    if (!adminConfig) {
+      return
+    }
+
+    const nextExperiments = [...adminConfig.experiments]
+    const current = nextExperiments[experimentIndex]
+    if (!current) {
+      return
+    }
+
+    nextExperiments[experimentIndex] = {
+      ...current,
+      [key]: value,
+    }
+
+    setAdminConfig({
+      ...adminConfig,
+      experiments: nextExperiments,
+    })
+  }
+
+  function updateExperimentNumArms(experimentIndex: number, nextNumArms: number) {
+    if (!adminConfig) {
+      return
+    }
+
+    const nextExperiments = [...adminConfig.experiments]
+    const current = nextExperiments[experimentIndex]
+    if (!current) {
+      return
+    }
+
+    const safeNumArms = Number.isInteger(nextNumArms)
+      ? Math.min(20, Math.max(2, nextNumArms))
+      : current.numArms
+
+    const currentProbabilities = current.armProbabilities ?? []
+    const resized = Array.from({ length: safeNumArms }, (_, index) => {
+      if (index < currentProbabilities.length && Number.isFinite(currentProbabilities[index])) {
+        return Number(currentProbabilities[index].toFixed(4))
+      }
+      return 0.5
+    })
+
+    nextExperiments[experimentIndex] = {
+      ...current,
+      numArms: safeNumArms,
+      armProbabilities: resized,
+    }
+
+    setAdminConfig({
+      ...adminConfig,
+      experiments: nextExperiments,
+    })
+  }
+
+  function updateExperimentArmProbability(experimentIndex: number, armIndex: number, value: string) {
+    if (!adminConfig) {
+      return
+    }
+
+    const nextExperiments = [...adminConfig.experiments]
+    const current = nextExperiments[experimentIndex]
+    if (!current) {
+      return
+    }
+
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) {
+      return
+    }
+
+    const clamped = Math.min(1, Math.max(0, parsed))
+    const next = [...current.armProbabilities]
+    next[armIndex] = Number(clamped.toFixed(4))
+
+    nextExperiments[experimentIndex] = {
+      ...current,
+      armProbabilities: next,
+    }
+
+    setAdminConfig({
+      ...adminConfig,
+      experiments: nextExperiments,
+    })
+  }
+
+  function updatePracticeNumArms(nextNumArms: number) {
     if (!adminConfig) {
       return
     }
 
     const safeNumArms = Number.isInteger(nextNumArms)
       ? Math.min(20, Math.max(2, nextNumArms))
-      : adminConfig.numArms
+      : adminConfig.practiceConfig.numArms
 
-    const current = adminConfig.armProbabilities ?? []
+    const currentProbabilities = adminConfig.practiceConfig.armProbabilities ?? []
     const resized = Array.from({ length: safeNumArms }, (_, index) => {
-      if (index < current.length && Number.isFinite(current[index])) {
-        return Number(current[index].toFixed(4))
+      if (index < currentProbabilities.length && Number.isFinite(currentProbabilities[index])) {
+        return Number(currentProbabilities[index].toFixed(4))
       }
       return 0.5
     })
 
     setAdminConfig({
       ...adminConfig,
-      numArms: safeNumArms,
-      armProbabilities: resized,
+      practiceConfig: {
+        ...adminConfig.practiceConfig,
+        numArms: safeNumArms,
+        armProbabilities: resized,
+      },
     })
   }
 
-  function updateArmProbability(index: number, value: string) {
+  function updatePracticeArmProbability(armIndex: number, value: string) {
     if (!adminConfig) {
       return
     }
@@ -684,12 +1014,47 @@ function App() {
     }
 
     const clamped = Math.min(1, Math.max(0, parsed))
-    const next = [...adminConfig.armProbabilities]
-    next[index] = Number(clamped.toFixed(4))
+    const next = [...adminConfig.practiceConfig.armProbabilities]
+    next[armIndex] = Number(clamped.toFixed(4))
 
     setAdminConfig({
       ...adminConfig,
-      armProbabilities: next,
+      practiceConfig: {
+        ...adminConfig.practiceConfig,
+        armProbabilities: next,
+      },
+    })
+  }
+
+  function addExperimentConfig() {
+    if (!adminConfig) {
+      return
+    }
+
+    const nextIndex = adminConfig.experiments.length + 1
+    const newExperiment: ExperimentDefinition = {
+      id: `exp_${nextIndex}`,
+      label: `Experiment ${nextIndex}`,
+      enabled: true,
+      numArms: 2,
+      armProbabilities: [0.5, 0.5],
+      finalRounds: 30,
+    }
+
+    setAdminConfig({
+      ...adminConfig,
+      experiments: [...adminConfig.experiments, newExperiment],
+    })
+  }
+
+  function removeExperimentConfig(experimentIndex: number) {
+    if (!adminConfig || adminConfig.experiments.length <= 1) {
+      return
+    }
+
+    setAdminConfig({
+      ...adminConfig,
+      experiments: adminConfig.experiments.filter((_, index) => index !== experimentIndex),
     })
   }
 
@@ -699,7 +1064,7 @@ function App() {
         <p className="eyebrow">Behavioral Experiment Platform</p>
         <h1>{experimentBrief?.title ?? 'Multi-Armed Bandit Study'}</h1>
         <p className="hero-copy">
-          Controlled participant experiments with required memory testing, optional practice,
+          Controlled participant experiments with configurable feedback visibility, optional practice,
           and admin-managed A/B conditions.
         </p>
 
@@ -734,10 +1099,6 @@ function App() {
           <h2>Participant Instructions</h2>
           <p className="question-text">Purpose: {experimentBrief.purpose}</p>
           <p className="question-text">Instructions: {experimentBrief.instructions}</p>
-          <p className="setup-note">
-            The memory questionnaire is mandatory to complete the experiment. It does not
-            affect your score.
-          </p>
 
           <label>
             Participant ID (required)
@@ -748,18 +1109,30 @@ function App() {
             />
           </label>
 
+          {experimentBrief.experiments.length === 0 && (
+            <p className="setup-note">No enabled experiments are currently available.</p>
+          )}
+
           <p className="setup-note">
-            Each participant ID can complete the final experiment only once.
+            Practice trial is separate and only for familiarization. Final trial runs all enabled
+            experiments one by one automatically.
           </p>
 
           <div className="action-row">
             {experimentBrief.practiceEnabled && (
-              <button className="secondary-button" onClick={() => startSession('practice')}>
-                Start Practice Run
+              <button
+                className="secondary-button"
+                onClick={() => startSession('practice')}
+              >
+                Start Practice Trial
               </button>
             )}
-            <button className="primary-button" onClick={() => startSession('final')}>
-              Start Final Run
+            <button
+              className="primary-button"
+              onClick={() => startSession('final')}
+              disabled={experimentBrief.experiments.length === 0}
+            >
+              Start Final Trial (All Experiments)
             </button>
           </div>
         </section>
@@ -774,13 +1147,23 @@ function App() {
             </p>
           </div>
 
-          <p className="condition-pill">Visibility: {visibilityLabels[visibilityMode]}</p>
-          <p className="setup-note">A/B Group: {abGroup}</p>
+          <p className="setup-note">
+            Experiment: {activeExperimentLabel || 'Selected experiment'}
+          </p>
+          {sequenceExperiments.length > 0 && (
+            <p className="setup-note">
+              Experiment progress: {sequenceIndex + 1} / {sequenceExperiments.length}
+            </p>
+          )}
 
           <section className="pull-feedback-panel">
             <p className="pull-status-line">
-              {pullInProgress && activeArmIndex !== null
+              {saving
+                ? 'Saving session results...'
+                : pullInProgress && activeArmIndex !== null
                 ? `Pulling Arm ${activeArmIndex + 1}... revealing reward shortly`
+                : pullInProgress
+                ? 'Finalizing this experiment. Please wait...'
                 : 'Choose one arm, then wait for the reward reveal before the next pull.'}
             </p>
             <p className="score-line">Total reward so far: {totalRewardSoFar}</p>
@@ -796,10 +1179,7 @@ function App() {
 
           <div className="arm-grid">
             {Array.from({ length: numArms }, (_, armIndex) => {
-              const history = visibleByArm[armIndex] ?? []
               const armPulls = pullsByArm[armIndex] ?? []
-              const rewardSum = armPulls.reduce((sum, pull) => sum + pull.reward, 0)
-              const rewardAvg = armPulls.length > 0 ? rewardSum / armPulls.length : 0
 
               return (
                 <article
@@ -810,61 +1190,79 @@ function App() {
                   <button
                     className="secondary-button"
                     onClick={() => pullArm(armIndex)}
-                    disabled={pullInProgress}
+                    disabled={pullInProgress || saving}
                   >
                     Pull Arm {armIndex + 1}
                   </button>
-                  {visibilityMode === 'summary' ? (
+                  {showCurrentArmProbabilities && (
                     <p className="history-line">
-                      pulls={armPulls.length}, avg={format(rewardAvg)}
+                      Estimated reward probability (from your pulls):{' '}
+                      {estimatedProbabilityByArm[armIndex] === null
+                        ? 'Not enough data yet'
+                        : format(estimatedProbabilityByArm[armIndex] ?? 0)}
                     </p>
-                  ) : visibilityMode === 'none' ? (
-                    <p className="history-line">history hidden</p>
-                  ) : (
-                    <p className="history-line">
-                      visible rewards: {history.length > 0 ? history.join(', ') : 'none yet'}
-                    </p>
+                  )}
+                  {showArmPullCounts && (
+                    <p className="history-line">Times pulled: {armPulls.length}</p>
                   )}
                 </article>
               )
             })}
           </div>
 
-          <div className="setup-note">
-            Latest reward: {pulls.length > 0 ? pulls[pulls.length - 1].reward : 'No pull yet'}
+          {showRoundHistory && (
+            <section>
+              <h3>Round History</h3>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Round</th>
+                      <th>Arm</th>
+                      <th>Reward</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pulls.map((pull) => (
+                      <tr key={`${pull.roundIndex}-${pull.armIndex}-${pull.reward}`}>
+                        <td>{pull.roundIndex + 1}</td>
+                        <td>{pull.armIndex + 1}</td>
+                        <td>{pull.reward}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
+          <div className="action-row">
+            <button
+              className="danger-button"
+              onClick={() => void exitCurrentTrial()}
+              disabled={saving}
+            >
+              Exit Trial
+            </button>
           </div>
         </section>
       )}
 
-      {mode === 'participant' && participantStage === 'questionnaire' && (
+      {mode === 'participant' && participantStage === 'between-experiments' && (
         <section className="panel">
-          <h2>Memory Questionnaire</h2>
-          <p className="question-text">
-            For Arm {questionTargetArm + 1}, list rewards you remember from most recent to
-            older in order. Use comma or space separated numbers.
+          <h2>Experiment Complete</h2>
+          <p className="setup-note">
+            {justCompletedExperimentLabel || `Experiment ${sequenceIndex + 1}`} has ended.
           </p>
-          <textarea
-            value={recalledSequenceInput}
-            onChange={(event) => setRecalledSequenceInput(event.target.value)}
-            rows={4}
-            placeholder="Example: 1, 0, 1, 1"
-          />
-
-          <label>
-            What average reward do you think this arm gives?
-            <input
-              type="number"
-              min={0}
-              max={1}
-              step="0.01"
-              value={perceivedAverageInput}
-              onChange={(event) => setPerceivedAverageInput(event.target.value)}
-              placeholder="Example: 0.62"
-            />
-          </label>
-
-          <button className="primary-button" onClick={submitQuestionnaire} disabled={saving}>
-            {saving ? 'Saving...' : 'Submit Answers'}
+          <p className="setup-note">
+            Click below when you are ready to start the next experiment.
+          </p>
+          <button
+            className="primary-button"
+            onClick={() => void continueToNextExperiment()}
+            disabled={pendingNextIndex === null}
+          >
+            Start Next Experiment ({(pendingNextIndex ?? sequenceIndex) + 1} / {sequenceExperiments.length})
           </button>
         </section>
       )}
@@ -876,49 +1274,54 @@ function App() {
             <li>Total reward: {format(metrics.totalReward)}</li>
             <li>Average reward per round: {format(metrics.averageReward)}</li>
             <li>Expected regret: {format(metrics.expectedRegret)}</li>
-            <li>
-              Recency-weighted recall accuracy:{' '}
-              {metrics.recencyWeightedAccuracy === null
-                ? 'N/A'
-                : format(metrics.recencyWeightedAccuracy)}
-            </li>
           </ul>
           <p className="setup-note">
-            Practice is not counted in final performance. Complete the final run next.
+            Practice trial complete. You can now start the final sequence.
           </p>
           <button className="primary-button" onClick={() => startSession('final')}>
-            Start Final Run
+            Start Final Trial (All Experiments)
           </button>
         </section>
       )}
 
       {mode === 'participant' && participantStage === 'final-complete' && metrics && (
         <section className="panel">
-          <h2>Final Run Complete</h2>
+          <h2>Final Trial Complete</h2>
+          <p className="setup-note">Summary across all final experiments:</p>
+
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Experiment</th>
+                  <th>Total Reward</th>
+                  <th>Avg Reward</th>
+                  <th>Expected Regret</th>
+                  <th>Unique Arms</th>
+                </tr>
+              </thead>
+              <tbody>
+                {finalExperimentSummaries.map((row, rowIndex) => (
+                  <tr key={`${row.experimentLabel}-${rowIndex}`}>
+                    <td>{row.experimentLabel}</td>
+                    <td>{format(row.totalReward)}</td>
+                    <td>{format(row.averageReward)}</td>
+                    <td>{format(row.expectedRegret)}</td>
+                    <td>{row.uniqueArmsChosen}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
           <ul className="metrics-list">
-            <li>Total reward: {format(metrics.totalReward)}</li>
-            <li>Average reward per round: {format(metrics.averageReward)}</li>
-            <li>
-              Best true arm: {metrics.bestArmIndex + 1} (mean={format(metrics.bestArmMean)})
-            </li>
-            <li>Expected regret: {format(metrics.expectedRegret)}</li>
-            <li>
-              Recency-weighted recall accuracy:{' '}
-              {metrics.recencyWeightedAccuracy === null
-                ? 'N/A'
-                : format(metrics.recencyWeightedAccuracy)}
-            </li>
-            <li>
-              Perceived-average error:{' '}
-              {metrics.perceivedAverageError === null
-                ? 'N/A'
-                : format(metrics.perceivedAverageError)}
-            </li>
-            <li>Unique arms chosen: {metrics.uniqueArmsChosen}</li>
+            <li>Combined total reward: {format(finalSummaryTotals.totalReward)}</li>
+            <li>Mean average reward: {format(finalSummaryTotals.meanAverageReward)}</li>
+            <li>Combined expected regret: {format(finalSummaryTotals.totalExpectedRegret)}</li>
           </ul>
 
           <p className="setup-note">
-            Session id: {sessionId}. The memory test was required to complete your experiment.
+            Final sequence complete. Last session id: {sessionId}.
           </p>
 
           <button className="primary-button" onClick={reset}>
@@ -952,6 +1355,16 @@ function App() {
           <div className="panel-header-row">
             <h2>Admin Dashboard</h2>
             <div className="action-row">
+              <button className="primary-button" onClick={saveAdminConfig} disabled={adminSaving}>
+                {adminSaving ? 'Saving...' : 'Save All Settings'}
+              </button>
+              <button
+                className="secondary-button"
+                onClick={() => void exportFourConfiguredCsvs()}
+                disabled={adminExporting}
+              >
+                {adminExporting ? 'Exporting CSVs...' : 'Export 4 CSVs'}
+              </button>
               <button className="secondary-button" onClick={refreshAdminData}>
                 Refresh Data
               </button>
@@ -962,7 +1375,7 @@ function App() {
           </div>
 
           <h3>Experiment Control</h3>
-          <div className="grid-2">
+          <div className="grid-3">
             <label>
               Study title
               <input
@@ -971,33 +1384,195 @@ function App() {
               />
             </label>
             <label>
-              Number of arms
+              Practice enabled
+              <select
+                value={adminConfig.practiceEnabled ? 'yes' : 'no'}
+                onChange={(event) => updateAdminConfig('practiceEnabled', event.target.value === 'yes')}
+              >
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </label>
+            <label>
+              Max final experiments per participant
               <input
                 type="number"
-                min={2}
-                max={20}
-                value={adminConfig.numArms}
-                onChange={(event) => updateNumArmsWithProbabilities(Number(event.target.value))}
+                min={1}
+                max={50}
+                value={adminConfig.maxFinalExperimentsPerParticipant}
+                onChange={(event) =>
+                  updateAdminConfig(
+                    'maxFinalExperimentsPerParticipant',
+                    Number(event.target.value)
+                  )
+                }
               />
             </label>
           </div>
 
-          <label>
-            Arm reward probabilities (0 to 1)
-            <div className="prob-grid">
-              {Array.from({ length: adminConfig.numArms }, (_, index) => (
-                <label key={`prob-${index}`} className="mini-label">
-                  Arm {index + 1}
+          <article className="arm-card">
+            <h3>Practice Trial Settings</h3>
+            <div className="grid-3">
+              <label>
+                Practice arms
+                <input
+                  type="number"
+                  min={2}
+                  max={20}
+                  value={adminConfig.practiceConfig.numArms}
+                  onChange={(event) => updatePracticeNumArms(Number(event.target.value))}
+                />
+              </label>
+              <label>
+                Practice rounds
+                <input
+                  type="number"
+                  min={3}
+                  max={200}
+                  value={adminConfig.practiceConfig.rounds}
+                  onChange={(event) =>
+                    updateAdminConfig('practiceConfig', {
+                      ...adminConfig.practiceConfig,
+                      rounds: Number(event.target.value),
+                    })
+                  }
+                />
+              </label>
+            </div>
+
+            <label>
+              Practice arm probabilities (0 to 1)
+              <div className="prob-grid">
+                {Array.from({ length: adminConfig.practiceConfig.numArms }, (_, armIndex) => (
+                  <label key={`practice-prob-${armIndex}`} className="mini-label">
+                    Arm {armIndex + 1}
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step="0.01"
+                      value={adminConfig.practiceConfig.armProbabilities[armIndex] ?? 0.5}
+                      onChange={(event) => updatePracticeArmProbability(armIndex, event.target.value)}
+                    />
+                  </label>
+                ))}
+              </div>
+            </label>
+          </article>
+
+          <div className="action-row">
+            <button className="secondary-button" onClick={addExperimentConfig}>
+              Add Experiment
+            </button>
+          </div>
+
+          <div className="grid-2">
+            {adminConfig.experiments.map((experiment, experimentIndex) => (
+              <article key={experiment.id} className="arm-card">
+                <div className="panel-header-row">
+                  <h3>{experiment.label || `Experiment ${experimentIndex + 1}`}</h3>
+                  <button
+                    className="danger-button small"
+                    onClick={() => removeExperimentConfig(experimentIndex)}
+                    disabled={adminConfig.experiments.length <= 1}
+                  >
+                    Remove
+                  </button>
+                </div>
+
+                <label>
+                  Experiment ID
                   <input
-                    type="number"
-                    min={0}
-                    max={1}
-                    step="0.01"
-                    value={adminConfig.armProbabilities[index] ?? 0.5}
-                    onChange={(event) => updateArmProbability(index, event.target.value)}
+                    value={experiment.id}
+                    onChange={(event) =>
+                      updateExperimentField(experimentIndex, 'id', event.target.value)
+                    }
                   />
                 </label>
-              ))}
+
+                <label>
+                  Label
+                  <input
+                    value={experiment.label}
+                    onChange={(event) =>
+                      updateExperimentField(experimentIndex, 'label', event.target.value)
+                    }
+                  />
+                </label>
+
+                <label>
+                  Enabled
+                  <select
+                    value={experiment.enabled ? 'yes' : 'no'}
+                    onChange={(event) =>
+                      updateExperimentField(experimentIndex, 'enabled', event.target.value === 'yes')
+                    }
+                  >
+                    <option value="yes">Yes</option>
+                    <option value="no">No</option>
+                  </select>
+                </label>
+
+                <div className="grid-3">
+                  <label>
+                    Number of arms
+                    <input
+                      type="number"
+                      min={2}
+                      max={20}
+                      value={experiment.numArms}
+                      onChange={(event) =>
+                        updateExperimentNumArms(experimentIndex, Number(event.target.value))
+                      }
+                    />
+                  </label>
+                  <label>
+                    Final rounds
+                    <input
+                      type="number"
+                      min={5}
+                      max={500}
+                      value={experiment.finalRounds}
+                      onChange={(event) =>
+                        updateExperimentField(
+                          experimentIndex,
+                          'finalRounds',
+                          Number(event.target.value)
+                        )
+                      }
+                    />
+                  </label>
+                </div>
+
+                <label>
+                  Arm reward probabilities (0 to 1)
+                  <div className="prob-grid">
+                    {Array.from({ length: experiment.numArms }, (_, armIndex) => (
+                      <label key={`${experiment.id}-prob-${armIndex}`} className="mini-label">
+                        Arm {armIndex + 1}
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step="0.01"
+                          value={experiment.armProbabilities[armIndex] ?? 0.5}
+                          onChange={(event) =>
+                            updateExperimentArmProbability(experimentIndex, armIndex, event.target.value)
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
+                </label>
+              </article>
+            ))}
+          </div>
+
+          <label>
+            Participant rule
+            <div className="setup-note">
+              Unlimited practice runs are allowed. Final runs are limited to one per experiment,
+              with the global cap set above.
             </div>
           </label>
 
@@ -1021,41 +1596,6 @@ function App() {
 
           <div className="grid-3">
             <label>
-              Practice enabled
-              <select
-                value={adminConfig.practiceEnabled ? 'yes' : 'no'}
-                onChange={(event) => updateAdminConfig('practiceEnabled', event.target.value === 'yes')}
-              >
-                <option value="yes">Yes</option>
-                <option value="no">No</option>
-              </select>
-            </label>
-            <label>
-              Practice rounds
-              <input
-                type="number"
-                min={3}
-                max={200}
-                value={adminConfig.practiceRounds}
-                onChange={(event) =>
-                  updateAdminConfig('practiceRounds', Number(event.target.value))
-                }
-              />
-            </label>
-            <label>
-              Final rounds
-              <input
-                type="number"
-                min={5}
-                max={500}
-                value={adminConfig.finalRounds}
-                onChange={(event) => updateAdminConfig('finalRounds', Number(event.target.value))}
-              />
-            </label>
-          </div>
-
-          <div className="grid-3">
-            <label>
               A/B testing enabled
               <select
                 value={adminConfig.abTestingEnabled ? 'yes' : 'no'}
@@ -1069,11 +1609,11 @@ function App() {
             </label>
 
             <label>
-              Group A visibility
+              Default visibility mode (used when A/B is disabled)
               <select
-                value={adminConfig.groupConfigs.A.visibilityMode}
+                value={adminConfig.defaultVisibilityMode}
                 onChange={(event) =>
-                  updateGroupVisibility('A', event.target.value as VisibilityMode)
+                  updateAdminConfig('defaultVisibilityMode', event.target.value as VisibilityMode)
                 }
               >
                 <option value="none">None</option>
@@ -1083,40 +1623,140 @@ function App() {
               </select>
             </label>
 
-            <label>
-              Group B visibility
-              <select
-                value={adminConfig.groupConfigs.B.visibilityMode}
-                onChange={(event) =>
-                  updateGroupVisibility('B', event.target.value as VisibilityMode)
-                }
-              >
-                <option value="none">None</option>
-                <option value="last-3">Last 3</option>
-                <option value="full">Full</option>
-                <option value="summary">Summary</option>
-              </select>
-            </label>
+            <div className="setup-note">
+              Total reward and the last reward for each arm are always shown to participants.
+            </div>
           </div>
 
-          <label>
-            Default visibility mode (used when A/B is disabled)
-            <select
-              value={adminConfig.defaultVisibilityMode}
-              onChange={(event) =>
-                updateAdminConfig('defaultVisibilityMode', event.target.value as VisibilityMode)
-              }
-            >
-              <option value="none">None</option>
-              <option value="last-3">Last 3</option>
-              <option value="full">Full</option>
-              <option value="summary">Summary</option>
-            </select>
-          </label>
+          <div className="grid-2">
+            <article className="arm-card">
+              <h3>Group A Details</h3>
+              <label>
+                Visibility mode
+                <select
+                  value={adminConfig.groupConfigs.A.visibilityMode}
+                  onChange={(event) =>
+                    updateGroupVisibility('A', event.target.value as VisibilityMode)
+                  }
+                >
+                  <option value="none">None</option>
+                  <option value="last-3">Last 3</option>
+                  <option value="full">Full</option>
+                  <option value="summary">Summary</option>
+                </select>
+              </label>
 
-          <button className="primary-button" onClick={saveAdminConfig}>
-            Save Experiment Config
-          </button>
+              <label>
+                Show full round history (round, arm, reward)
+                <select
+                  value={adminConfig.groupConfigs.A.showRoundHistory ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle('A', 'showRoundHistory', event.target.value === 'yes')
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+
+              <label>
+                Show arm pull counts
+                <select
+                  value={adminConfig.groupConfigs.A.showArmPullCounts ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle('A', 'showArmPullCounts', event.target.value === 'yes')
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+
+              <label>
+                Show current arm reward probabilities
+                <select
+                  value={adminConfig.groupConfigs.A.showCurrentArmProbabilities ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle(
+                      'A',
+                      'showCurrentArmProbabilities',
+                      event.target.value === 'yes'
+                    )
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+            </article>
+
+            <article className="arm-card">
+              <h3>Group B Details</h3>
+              <label>
+                Visibility mode
+                <select
+                  value={adminConfig.groupConfigs.B.visibilityMode}
+                  onChange={(event) =>
+                    updateGroupVisibility('B', event.target.value as VisibilityMode)
+                  }
+                >
+                  <option value="none">None</option>
+                  <option value="last-3">Last 3</option>
+                  <option value="full">Full</option>
+                  <option value="summary">Summary</option>
+                </select>
+              </label>
+
+              <label>
+                Show full round history (round, arm, reward)
+                <select
+                  value={adminConfig.groupConfigs.B.showRoundHistory ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle('B', 'showRoundHistory', event.target.value === 'yes')
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+
+              <label>
+                Show arm pull counts
+                <select
+                  value={adminConfig.groupConfigs.B.showArmPullCounts ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle('B', 'showArmPullCounts', event.target.value === 'yes')
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+
+              <label>
+                Show current arm reward probabilities
+                <select
+                  value={adminConfig.groupConfigs.B.showCurrentArmProbabilities ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle(
+                      'B',
+                      'showCurrentArmProbabilities',
+                      event.target.value === 'yes'
+                    )
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+            </article>
+          </div>
+
+          <div className="action-row">
+            <button className="primary-button" onClick={saveAdminConfig} disabled={adminSaving}>
+              {adminSaving ? 'Saving...' : 'Save All Settings'}
+            </button>
+          </div>
 
           <h3 className="admin-table-title">Recent Session Results</h3>
           <div className="table-wrap">
@@ -1125,6 +1765,7 @@ function App() {
                 <tr>
                   <th>Session</th>
                   <th>Participant</th>
+                  <th>Experiment</th>
                   <th>Run</th>
                   <th>Group</th>
                   <th>Total</th>
@@ -1140,6 +1781,7 @@ function App() {
                   <tr key={row.id}>
                     <td>{row.id.slice(-8)}</td>
                     <td>{row.participant_id ?? '-'}</td>
+                    <td>{row.experiment_id ?? '-'}</td>
                     <td>{row.run_type}</td>
                     <td>{row.ab_group}</td>
                     <td>{row.total_reward === null ? '-' : format(row.total_reward)}</td>
