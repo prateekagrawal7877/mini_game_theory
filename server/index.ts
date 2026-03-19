@@ -347,11 +347,23 @@ function chooseBalancedGroup(config: ExperimentConfig): ABGroup {
 
   const countA = Number(counts.count_a ?? 0)
   const countB = Number(counts.count_b ?? 0)
-  const imbalance = countB - countA
+  const diff = countA - countB
 
-  // Keep assignment random, but bias toward the underrepresented group as imbalance grows.
-  const probabilityOfA = Math.min(0.85, Math.max(0.15, 0.5 + imbalance * 0.12))
-  return secureRandom01() < probabilityOfA ? 'A' : 'B'
+  // Keep assignment random, while strongly pulling toward the underrepresented group.
+  // diff > 0 means A has more participants, so bias toward B (and vice versa).
+  if (diff === 0) {
+    return secureRandom01() < 0.5 ? 'A' : 'B'
+  }
+
+  const underrepresented: ABGroup = diff > 0 ? 'B' : 'A'
+  const absDiff = Math.abs(diff)
+  const underrepresentedProbability = absDiff >= 2 ? 0.95 : 0.75
+
+  return secureRandom01() < underrepresentedProbability
+    ? underrepresented
+    : underrepresented === 'A'
+    ? 'B'
+    : 'A'
 }
 
 function getVisibilityMode(config: ExperimentConfig, group: ABGroup): VisibilityMode {
