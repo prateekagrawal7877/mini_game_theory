@@ -153,6 +153,10 @@ function format(value: number): string {
   return value.toFixed(3)
 }
 
+function normalizeParticipantIdentifier(value: string): string {
+  return value.trim().toLowerCase()
+}
+
 async function parseJsonResponse<T>(response: Response): Promise<T | null> {
   const raw = await response.text()
   if (!raw.trim()) {
@@ -198,6 +202,11 @@ function App() {
   const [participantStage, setParticipantStage] = useState<ParticipantStage>('loading')
   const [experimentBrief, setExperimentBrief] = useState<ExperimentBrief | null>(null)
   const [participantId, setParticipantId] = useState<string>('')
+  const [participantOtp, setParticipantOtp] = useState<string>('')
+  const [participantOtpRequested, setParticipantOtpRequested] = useState<boolean>(false)
+  const [participantVerified, setParticipantVerified] = useState<boolean>(false)
+  const [participantLoginToken, setParticipantLoginToken] = useState<string>('')
+  const [authBusy, setAuthBusy] = useState<boolean>(false)
   const [activeParticipantId, setActiveParticipantId] = useState<string>('')
   const [sequenceExperiments, setSequenceExperiments] = useState<ExperimentDefinition[]>([])
   const [sequenceIndex, setSequenceIndex] = useState<number>(0)
@@ -559,6 +568,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           participantId: normalizedParticipantId,
+          loginToken: participantLoginToken,
           experimentId: experiment?.id,
           runType: nextRunType,
         }),
@@ -600,10 +610,10 @@ function App() {
   }
 
   async function startSession(nextRunType: RunType) {
-    const normalizedParticipantId = participantId.trim().toUpperCase()
+    const normalizedParticipantId = normalizeParticipantIdentifier(participantId)
 
-    if (!/^[A-Z0-9_-]{4,32}$/.test(normalizedParticipantId)) {
-      setError('Participant ID is required. Use 4-32 chars: letters, numbers, _ or -.')
+    if (!participantVerified || !participantLoginToken) {
+      setError('Please verify your email with OTP before starting the experiment.')
       return
     }
 
@@ -688,7 +698,7 @@ function App() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            participantId: activeParticipantId || participantId.trim().toUpperCase(),
+            participantId: activeParticipantId || normalizeParticipantIdentifier(participantId),
           }),
         })
 
@@ -888,6 +898,94 @@ function App() {
     setActiveArmIndex(null)
     setLatestPullFeedback(null)
     setError('')
+  }
+
+  async function requestParticipantOtp() {
+    const normalizedParticipantId = normalizeParticipantIdentifier(participantId)
+    if (!normalizedParticipantId) {
+      setError('Please enter your email first.')
+      return
+    }
+
+    try {
+      setAuthBusy(true)
+      setError('')
+
+      const response = await fetch('/api/auth/request-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: normalizedParticipantId }),
+      })
+
+      const data = await parseJsonResponse<{ error?: string; warning?: string }>(response)
+      if (!response.ok) {
+        throw new Error(buildHttpErrorMessage(data, 'Failed to request OTP', response))
+      }
+
+      setParticipantOtpRequested(true)
+      setParticipantVerified(false)
+      setParticipantLoginToken('')
+
+      if (data?.warning) {
+        setAdminMessage(`${data.warning} Please retry in a moment or use the tester account.`)
+      } else {
+        setAdminMessage('OTP sent. Please check your email and enter the code below.')
+      }
+    } catch (err) {
+      setError(toUserErrorMessage(err, 'Failed to request OTP'))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function verifyParticipantOtp() {
+    const normalizedParticipantId = normalizeParticipantIdentifier(participantId)
+    const normalizedOtp = participantOtp.trim()
+
+    if (!normalizedParticipantId || !normalizedOtp) {
+      setError('Enter both email and OTP code to verify.')
+      return
+    }
+
+    try {
+      setAuthBusy(true)
+      setError('')
+
+      const response = await fetch('/api/auth/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: normalizedParticipantId,
+          otp: normalizedOtp,
+        }),
+      })
+
+      const data = await parseJsonResponse<{
+        error?: string
+        participantId?: string
+        loginToken?: string
+      }>(response)
+
+      if (!response.ok) {
+        throw new Error(buildHttpErrorMessage(data, 'Failed to verify OTP', response))
+      }
+
+      if (!data?.participantId || !data?.loginToken) {
+        throw new Error('Invalid OTP verification response from server.')
+      }
+
+      setParticipantId(data.participantId)
+      setActiveParticipantId(data.participantId)
+      setParticipantLoginToken(data.loginToken)
+      setParticipantVerified(true)
+      setAdminMessage('Email verified. You can now start the experiment.')
+    } catch (err) {
+      setParticipantVerified(false)
+      setParticipantLoginToken('')
+      setError(toUserErrorMessage(err, 'Failed to verify OTP'))
+    } finally {
+      setAuthBusy(false)
+    }
   }
 
   function updateAdminConfig<K extends keyof ExperimentConfig>(key: K, value: ExperimentConfig[K]) {
@@ -1173,13 +1271,52 @@ function App() {
           <p className="question-text">Instructions: {experimentBrief.instructions}</p>
 
           <label>
-            Participant ID (required)
+            Email (required)
             <input
+              type="text"
               value={participantId}
-              onChange={(event) => setParticipantId(event.target.value)}
-              placeholder="e.g. P_0142"
+              onChange={(event) => {
+                setParticipantId(event.target.value)
+                setParticipantVerified(false)
+                setParticipantLoginToken('')
+              }}
+              placeholder="e.g. user@example.com"
             />
           </label>
+
+          <div className="action-row">
+            <button
+              className="secondary-button"
+              onClick={() => void requestParticipantOtp()}
+              disabled={authBusy}
+            >
+              {authBusy ? 'Please wait...' : 'Send OTP'}
+            </button>
+          </div>
+
+          {participantOtpRequested && (
+            <>
+              <label>
+                Enter OTP
+                <input
+                  value={participantOtp}
+                  onChange={(event) => setParticipantOtp(event.target.value)}
+                  placeholder="6-digit OTP"
+                />
+              </label>
+              <div className="action-row">
+                <button
+                  className="secondary-button"
+                  onClick={() => void verifyParticipantOtp()}
+                  disabled={authBusy}
+                >
+                  Verify OTP
+                </button>
+              </div>
+            </>
+          )}
+
+          {participantVerified && <p className="ok-banner">Email verified successfully.</p>}
 
           {experimentBrief.experiments.length === 0 && (
             <p className="setup-note">No enabled experiments are currently available.</p>
@@ -1195,6 +1332,7 @@ function App() {
               <button
                 className="secondary-button"
                 onClick={() => startSession('practice')}
+                disabled={!participantVerified || !participantLoginToken}
               >
                 Start Practice Trial
               </button>
@@ -1202,7 +1340,7 @@ function App() {
             <button
               className="primary-button"
               onClick={() => startSession('final')}
-              disabled={experimentBrief.experiments.length === 0}
+              disabled={experimentBrief.experiments.length === 0 || !participantVerified || !participantLoginToken}
             >
               Start Final Trial (All Experiments)
             </button>

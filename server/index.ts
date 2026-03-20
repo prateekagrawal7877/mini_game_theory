@@ -1,7 +1,9 @@
+import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
 import db from './db'
 import crypto from 'node:crypto'
+import nodemailer from 'nodemailer'
 
 type VisibilityMode = 'none' | 'last-3' | 'full' | 'summary'
 
@@ -94,6 +96,76 @@ const app = express()
 const port = Number(process.env.PORT ?? 8787)
 const adminPassword = process.env.ADMIN_PASSWORD ?? 'change-me-now'
 const adminTokens = new Map<string, number>()
+
+const TEST_PARTICIPANT_ID = 'prateek@kriti'
+const TEST_OTP = '123456'
+const OTP_TTL_MS = 10 * 60 * 1000
+const LOGIN_TOKEN_TTL_MS = 2 * 60 * 60 * 1000
+
+type PendingOtp = {
+  otp: string
+  expiresAt: number
+}
+
+type LoginTokenSession = {
+  participantId: string
+  expiresAt: number
+}
+
+const pendingOtps = new Map<string, PendingOtp>()
+const loginTokens = new Map<string, LoginTokenSession>()
+
+function createOtpCode(): string {
+  return String(Math.floor(100000 + Math.random() * 900000))
+}
+
+function createLoginToken(participantId: string): string {
+  const token = createId('login')
+  loginTokens.set(token, {
+    participantId,
+    expiresAt: Date.now() + LOGIN_TOKEN_TTL_MS,
+  })
+  return token
+}
+
+function isValidLoginToken(token: string, participantId: string): boolean {
+  const row = loginTokens.get(token)
+  if (!row) {
+    return false
+  }
+
+  if (row.expiresAt < Date.now()) {
+    loginTokens.delete(token)
+    return false
+  }
+
+  return row.participantId === participantId
+}
+
+const otpSenderEmail = process.env.OTP_SENDER_EMAIL ?? ''
+const otpSenderPassword = process.env.OTP_SENDER_PASSWORD ?? ''
+const allowOtpDeliveryFallback =
+  String(process.env.ALLOW_OTP_DELIVERY_FALLBACK ?? (process.env.NODE_ENV !== 'production')) ===
+  'true'
+
+const otpTransporter = nodemailer.createTransport({
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  auth: {
+    user: otpSenderEmail,
+    pass: otpSenderPassword,
+  },
+})
+
+async function sendOtpEmail(recipientEmail: string, otp: string): Promise<void> {
+  await otpTransporter.sendMail({
+    from: otpSenderEmail,
+    to: recipientEmail,
+    subject: 'Your Experiment OTP Code',
+    text: `Your OTP code is ${otp}. It expires in 10 minutes.`,
+  })
+}
 
 app.use(cors())
 app.use(express.json({ limit: '2mb' }))
@@ -592,11 +664,14 @@ function deleteSessionData(sessionId: string): void {
 }
 
 function normalizeParticipantId(input: unknown): string {
-  return String(input ?? '').trim().toUpperCase()
+  return String(input ?? '').trim().toLowerCase()
 }
 
 function isValidParticipantId(participantId: string): boolean {
-  return /^[A-Z0-9_-]{4,32}$/.test(participantId)
+  if (participantId === TEST_PARTICIPANT_ID) {
+    return true
+  }
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(participantId)
 }
 
 function escapeCsvCell(value: unknown): string {
@@ -868,23 +943,94 @@ app.get('/api/participant/experiment', (_req, res) => {
   })
 })
 
+app.post('/api/auth/request-otp', async (req, res) => {
+  const participantId = normalizeParticipantId(req.body?.email)
+
+  if (!participantId || !isValidParticipantId(participantId)) {
+    res.status(400).json({ error: 'Enter a valid email address.' })
+    return
+  }
+
+  const otp = participantId === TEST_PARTICIPANT_ID ? TEST_OTP : createOtpCode()
+  pendingOtps.set(participantId, {
+    otp,
+    expiresAt: Date.now() + OTP_TTL_MS,
+  })
+
+  try {
+    if (participantId !== TEST_PARTICIPANT_ID) {
+      await sendOtpEmail(participantId, otp)
+    }
+  } catch (error) {
+    console.error('OTP email delivery failed:', error)
+    if (!allowOtpDeliveryFallback) {
+      res.status(500).json({
+        error:
+          'Failed to send OTP email. Configure OTP sender credentials (prefer Gmail app password) and try again.',
+      })
+      return
+    }
+
+    res.json({
+      ok: true,
+      warning: 'Email delivery failed in fallback mode.',
+    })
+    return
+  }
+
+  res.json({ ok: true })
+})
+
+app.post('/api/auth/verify-otp', (req, res) => {
+  const participantId = normalizeParticipantId(req.body?.email)
+  const otp = String(req.body?.otp ?? '').trim()
+
+  if (!participantId || !isValidParticipantId(participantId)) {
+    res.status(400).json({ error: 'Enter a valid email address.' })
+    return
+  }
+
+  const pending = pendingOtps.get(participantId)
+  if (!pending || pending.expiresAt < Date.now()) {
+    pendingOtps.delete(participantId)
+    res.status(401).json({ error: 'OTP expired or not requested. Please request a new OTP.' })
+    return
+  }
+
+  if (pending.otp !== otp) {
+    res.status(401).json({ error: 'Invalid OTP.' })
+    return
+  }
+
+  pendingOtps.delete(participantId)
+  const loginToken = createLoginToken(participantId)
+
+  res.json({ ok: true, participantId, loginToken })
+})
+
 app.post('/api/sessions/start', (req, res) => {
   const participantId = normalizeParticipantId(req.body?.participantId)
+  const loginToken = String(req.body?.loginToken ?? '').trim()
   const requestedExperimentId = String(req.body?.experimentId ?? '').trim()
   const requestedRunType = String(req.body?.runType ?? 'final')
   const runType: RunType = requestedRunType === 'practice' ? 'practice' : 'final'
 
   if (!participantId) {
     res.status(400).json({
-      error: 'Participant ID is required. Use 4-32 chars: letters, numbers, _ or -.',
+      error: 'Participant email is required.',
     })
     return
   }
 
   if (!isValidParticipantId(participantId)) {
     res.status(400).json({
-      error: 'Invalid Participant ID format. Use 4-32 chars: letters, numbers, _ or -.',
+      error: 'Invalid participant email format.',
     })
+    return
+  }
+
+  if (!isValidLoginToken(loginToken, participantId)) {
+    res.status(401).json({ error: 'Login verification required. Verify OTP before starting.' })
     return
   }
 
@@ -910,7 +1056,7 @@ app.post('/api/sessions/start', (req, res) => {
 
   const abGroup = resolveParticipantGroup(config, participantId)
 
-  if (runType === 'final') {
+  if (runType === 'final' && participantId !== TEST_PARTICIPANT_ID) {
     const enabledExperimentCount = config.experiments.filter((experiment) => experiment.enabled).length
     const effectiveFinalLimit = Math.max(config.maxFinalExperimentsPerParticipant, enabledExperimentCount)
 
