@@ -102,44 +102,35 @@ const TEST_OTP = '123456'
 const OTP_TTL_MS = 10 * 60 * 1000
 const LOGIN_TOKEN_TTL_MS = 2 * 60 * 60 * 1000
 
-type PendingOtp = {
-  otp: string
-  expiresAt: number
-}
-
-type LoginTokenSession = {
-  participantId: string
-  expiresAt: number
-}
-
-const pendingOtps = new Map<string, PendingOtp>()
-const loginTokens = new Map<string, LoginTokenSession>()
-
 function createOtpCode(): string {
   return String(Math.floor(100000 + Math.random() * 900000))
 }
 
 function createLoginToken(participantId: string): string {
   const token = createId('login')
-  loginTokens.set(token, {
-    participantId,
-    expiresAt: Date.now() + LOGIN_TOKEN_TTL_MS,
-  })
+  const nowIso = new Date().toISOString()
+  const expiresAt = Date.now() + LOGIN_TOKEN_TTL_MS
+  insertLoginToken.run(token, participantId, expiresAt, nowIso)
   return token
 }
 
 function isValidLoginToken(token: string, participantId: string): boolean {
-  const row = loginTokens.get(token)
+  deleteExpiredLoginTokens.run(Date.now())
+
+  const row = selectLoginTokenByToken.get(token) as
+    | { participant_id: string; expires_at: number }
+    | undefined
+
   if (!row) {
     return false
   }
 
-  if (row.expiresAt < Date.now()) {
-    loginTokens.delete(token)
+  if (row.expires_at < Date.now()) {
+    deleteLoginTokenByToken.run(token)
     return false
   }
 
-  return row.participantId === participantId
+  return row.participant_id === participantId
 }
 
 const otpSenderEmail = process.env.OTP_SENDER_EMAIL ?? ''
@@ -169,6 +160,31 @@ async function sendOtpEmail(recipientEmail: string, otp: string): Promise<void> 
 
 app.use(cors())
 app.use(express.json({ limit: '2mb' }))
+
+const upsertOtpCode = db.prepare(
+  `INSERT INTO auth_otp_codes (email, otp, expires_at, created_at)
+   VALUES (?, ?, ?, ?)
+   ON CONFLICT(email) DO UPDATE SET
+     otp = excluded.otp,
+     expires_at = excluded.expires_at,
+     created_at = excluded.created_at`
+)
+
+const selectOtpCodeByEmail = db.prepare(
+  'SELECT otp, expires_at FROM auth_otp_codes WHERE email = ?'
+)
+
+const deleteOtpCodeByEmail = db.prepare('DELETE FROM auth_otp_codes WHERE email = ?')
+const deleteExpiredOtpCodes = db.prepare('DELETE FROM auth_otp_codes WHERE expires_at < ?')
+
+const insertLoginToken = db.prepare(
+  'INSERT INTO auth_login_tokens (token, participant_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
+)
+const selectLoginTokenByToken = db.prepare(
+  'SELECT participant_id, expires_at FROM auth_login_tokens WHERE token = ?'
+)
+const deleteLoginTokenByToken = db.prepare('DELETE FROM auth_login_tokens WHERE token = ?')
+const deleteExpiredLoginTokens = db.prepare('DELETE FROM auth_login_tokens WHERE expires_at < ?')
 
 const insertSession = db.prepare(
   `INSERT INTO sessions (
@@ -438,23 +454,14 @@ function chooseBalancedGroup(config: ExperimentConfig): ABGroup {
 
   const countA = Number(counts.count_a ?? 0)
   const countB = Number(counts.count_b ?? 0)
-  const diff = countA - countB
 
-  // Keep assignment random, while strongly pulling toward the underrepresented group.
-  // diff > 0 means A has more participants, so bias toward B (and vice versa).
-  if (diff === 0) {
+  // Strict balancing: always place the next participant in the smaller group.
+  // Random tie-break keeps assignment unbiased when counts are equal.
+  if (countA === countB) {
     return secureRandom01() < 0.5 ? 'A' : 'B'
   }
 
-  const underrepresented: ABGroup = diff > 0 ? 'B' : 'A'
-  const absDiff = Math.abs(diff)
-  const underrepresentedProbability = absDiff >= 2 ? 0.95 : 0.75
-
-  return secureRandom01() < underrepresentedProbability
-    ? underrepresented
-    : underrepresented === 'A'
-    ? 'B'
-    : 'A'
+  return countA < countB ? 'A' : 'B'
 }
 
 function getVisibilityMode(config: ExperimentConfig, group: ABGroup): VisibilityMode {
@@ -910,6 +917,8 @@ app.delete('/api/admin/history', requireAdminToken, (_req, res) => {
     db.prepare('DELETE FROM participant_experiments').run()
     db.prepare('DELETE FROM sessions').run()
     db.prepare('DELETE FROM participants').run()
+    db.prepare('DELETE FROM auth_otp_codes').run()
+    db.prepare('DELETE FROM auth_login_tokens').run()
   })
 
   deleteAllTransaction()
@@ -951,11 +960,10 @@ app.post('/api/auth/request-otp', async (req, res) => {
     return
   }
 
+  deleteExpiredOtpCodes.run(Date.now())
+
   const otp = participantId === TEST_PARTICIPANT_ID ? TEST_OTP : createOtpCode()
-  pendingOtps.set(participantId, {
-    otp,
-    expiresAt: Date.now() + OTP_TTL_MS,
-  })
+  upsertOtpCode.run(participantId, otp, Date.now() + OTP_TTL_MS, new Date().toISOString())
 
   try {
     if (participantId !== TEST_PARTICIPANT_ID) {
@@ -990,9 +998,14 @@ app.post('/api/auth/verify-otp', (req, res) => {
     return
   }
 
-  const pending = pendingOtps.get(participantId)
-  if (!pending || pending.expiresAt < Date.now()) {
-    pendingOtps.delete(participantId)
+  deleteExpiredOtpCodes.run(Date.now())
+
+  const pending = selectOtpCodeByEmail.get(participantId) as
+    | { otp: string; expires_at: number }
+    | undefined
+
+  if (!pending || pending.expires_at < Date.now()) {
+    deleteOtpCodeByEmail.run(participantId)
     res.status(401).json({ error: 'OTP expired or not requested. Please request a new OTP.' })
     return
   }
@@ -1002,7 +1015,7 @@ app.post('/api/auth/verify-otp', (req, res) => {
     return
   }
 
-  pendingOtps.delete(participantId)
+  deleteOtpCodeByEmail.run(participantId)
   const loginToken = createLoginToken(participantId)
 
   res.json({ ok: true, participantId, loginToken })

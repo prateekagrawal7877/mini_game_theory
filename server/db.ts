@@ -106,6 +106,20 @@ db.exec(`
     created_at TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
   );
+
+  CREATE TABLE IF NOT EXISTS auth_otp_codes (
+    email TEXT PRIMARY KEY,
+    otp TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS auth_login_tokens (
+    token TEXT PRIMARY KEY,
+    participant_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `)
 
 const sessionColumns = db

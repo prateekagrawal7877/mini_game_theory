@@ -335,6 +335,10 @@ textarea:focus {
   padding: 0.68rem 0.9rem;
   color: var(--danger);
   background: #fff1ed;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
 }
 
 .ok-banner {
@@ -344,6 +348,25 @@ textarea:focus {
   padding: 0.68rem 0.9rem;
   color: #0f5f48;
   background: #ebfff6;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.banner-close-button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-weight: 700;
+  line-height: 1;
+  padding: 0;
+  opacity: 0.8;
+}
+
+.banner-close-button:hover {
+  opacity: 1;
 }
 
 .action-row {

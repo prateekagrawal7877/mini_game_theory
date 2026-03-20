@@ -338,6 +338,30 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    if (!error) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      setError('')
+    }, 7000)
+
+    return () => window.clearTimeout(timer)
+  }, [error])
+
+  useEffect(() => {
+    if (!adminMessage) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      setAdminMessage('')
+    }, 7000)
+
+    return () => window.clearTimeout(timer)
+  }, [adminMessage])
+
   async function loadAdminData(token: string) {
     const [configResponse, sessionsResponse] = await Promise.all([
       fetch('/api/admin/experiment', { headers: { 'x-admin-token': token } }),
@@ -1254,8 +1278,32 @@ function App() {
         </div>
       </section>
 
-      {error && <p className="error-banner">{error}</p>}
-      {adminMessage && <p className="ok-banner">{adminMessage}</p>}
+      {error && (
+        <div className="error-banner">
+          <span>{error}</span>
+          <button
+            type="button"
+            className="banner-close-button"
+            onClick={() => setError('')}
+            aria-label="Dismiss error message"
+          >
+            x
+          </button>
+        </div>
+      )}
+      {adminMessage && (
+        <div className="ok-banner">
+          <span>{adminMessage}</span>
+          <button
+            type="button"
+            className="banner-close-button"
+            onClick={() => setAdminMessage('')}
+            aria-label="Dismiss notification"
+          >
+            x
+          </button>
+        </div>
+      )}
 
       {mode === 'participant' && participantStage === 'loading' && (
         <section className="panel">
