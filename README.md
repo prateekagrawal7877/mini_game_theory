@@ -122,6 +122,26 @@ npm run lint
 npm run build
 ```
 
+## Deploy on Vercel
+
+1. Import this repository in Vercel.
+2. In Project Settings -> Environment Variables, set:
+
+```bash
+ADMIN_PASSWORD="your-very-strong-password"
+OTP_SENDER_EMAIL="your-gmail-address@gmail.com"
+OTP_SENDER_PASSWORD="your-gmail-app-password"
+ALLOW_OTP_DELIVERY_FALLBACK="false"
+```
+
+3. Redeploy after adding environment variables.
+
+Notes:
+
+- `vercel.json` routes `/api/*` to the Express backend and serves the Vite frontend as static output.
+- On Vercel, the SQLite file is stored in `/tmp/data/bandit_game.sqlite`, which is writable but ephemeral.
+- For durable production data, move to a managed persistent database.
+
 ## Notes for Future Metric Customization
 
 When you specify the final metric definitions, update metric calculation in:
