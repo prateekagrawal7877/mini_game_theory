@@ -57,6 +57,7 @@ type ExperimentBrief = {
   title: string
   purpose: string
   instructions: string
+  exitAllowed: boolean
   practiceEnabled: boolean
   practiceConfig: PracticeConfig
   maxFinalExperimentsPerParticipant: number
@@ -66,11 +67,15 @@ type ExperimentBrief = {
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
     B: {
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
   }
 }
@@ -83,9 +88,12 @@ type SessionStartResponse = {
     numArms: number
     rounds: number
     visibilityMode: VisibilityMode
+    exitAllowed: boolean
     showRoundHistory: boolean
     showArmPullCounts: boolean
     showCurrentArmProbabilities: boolean
+    showGroupInstruction: boolean
+    groupInstruction: string
   }
   banditMeans: number[]
   experiment: {
@@ -100,6 +108,7 @@ type ExperimentConfig = {
   title: string
   purpose: string
   instructions: string
+  exitAllowed: boolean
   maxFinalExperimentsPerParticipant: number
   experiments: ExperimentDefinition[]
   practiceEnabled: boolean
@@ -112,12 +121,16 @@ type ExperimentConfig = {
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
     B: {
       visibilityMode: VisibilityMode
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
   }
 }
@@ -192,13 +205,17 @@ function App() {
   const [justCompletedExperimentLabel, setJustCompletedExperimentLabel] = useState<string>('')
   const [sequenceRunType, setSequenceRunType] = useState<RunType>('final')
   const [finalExperimentSummaries, setFinalExperimentSummaries] = useState<FinalExperimentSummary[]>([])
+  const [finalSequenceExitedEarly, setFinalSequenceExitedEarly] = useState<boolean>(false)
   const [activeExperimentLabel, setActiveExperimentLabel] = useState<string>('')
 
   const [numArms, setNumArms] = useState<number>(2)
   const [rounds, setRounds] = useState<number>(0)
+  const [exitAllowed, setExitAllowed] = useState<boolean>(true)
   const [showRoundHistory, setShowRoundHistory] = useState<boolean>(false)
   const [showArmPullCounts, setShowArmPullCounts] = useState<boolean>(false)
   const [showCurrentArmProbabilities, setShowCurrentArmProbabilities] = useState<boolean>(false)
+  const [showGroupInstruction, setShowGroupInstruction] = useState<boolean>(false)
+  const [groupInstruction, setGroupInstruction] = useState<string>('')
   const [runType, setRunType] = useState<RunType>('final')
 
   const [sessionId, setSessionId] = useState<string>('')
@@ -494,7 +511,7 @@ function App() {
     window.URL.revokeObjectURL(url)
   }
 
-  async function exportFourConfiguredCsvs() {
+  async function exportExperimentCsvs() {
     if (!adminConfig || adminExporting) {
       return
     }
@@ -504,21 +521,24 @@ function App() {
     setAdminMessage('')
 
     try {
-      const experiment1Id = adminConfig.experiments[0]?.id ?? 'exp_1'
-      const experiment2Id = adminConfig.experiments[1]?.id ?? 'exp_2'
+      const enabledExperimentIds = adminConfig.experiments
+        .filter((experiment) => experiment.enabled)
+        .map((experiment) => experiment.id)
 
-      await downloadAdminCsv('/api/admin/export/group/A', 'group_A_pull_history.csv')
-      await downloadAdminCsv('/api/admin/export/group/B', 'group_B_pull_history.csv')
-      await downloadAdminCsv(
-        `/api/admin/export/experiment/${encodeURIComponent(experiment1Id)}`,
-        `experiment_${experiment1Id}_pull_history.csv`
-      )
-      await downloadAdminCsv(
-        `/api/admin/export/experiment/${encodeURIComponent(experiment2Id)}`,
-        `experiment_${experiment2Id}_pull_history.csv`
-      )
+      if (enabledExperimentIds.length === 0) {
+        throw new Error('No enabled experiments found to export.')
+      }
 
-      setAdminMessage('Exported 4 CSV files: Group A, Group B, Experiment 1, Experiment 2.')
+      for (const experimentId of enabledExperimentIds) {
+        await downloadAdminCsv(
+          `/api/admin/export/experiment/${encodeURIComponent(experimentId)}`,
+          `experiment_${experimentId}_pull_history.csv`
+        )
+      }
+
+      setAdminMessage(
+        `Exported ${enabledExperimentIds.length} CSV file(s), one per experiment with A/B group labels included.`
+      )
     } catch (err) {
       setError(toUserErrorMessage(err, 'Failed to export CSV files'))
     } finally {
@@ -557,9 +577,12 @@ function App() {
       setSessionId(data.sessionId)
       setNumArms(data.settings.numArms)
       setRounds(data.settings.rounds)
+      setExitAllowed(data.settings.exitAllowed)
       setShowRoundHistory(data.settings.showRoundHistory)
       setShowArmPullCounts(data.settings.showArmPullCounts)
       setShowCurrentArmProbabilities(data.settings.showCurrentArmProbabilities)
+      setShowGroupInstruction(data.settings.showGroupInstruction)
+      setGroupInstruction(data.settings.groupInstruction)
       setActiveExperimentLabel(data.settings.experimentLabel)
       setBanditMeans(data.banditMeans)
       setRunType(data.runType)
@@ -586,6 +609,7 @@ function App() {
 
     setActiveParticipantId(normalizedParticipantId)
     setSequenceRunType(nextRunType)
+    setFinalSequenceExitedEarly(false)
     setPendingNextIndex(null)
     setJustCompletedExperimentLabel('')
 
@@ -676,6 +700,28 @@ function App() {
         setError(toUserErrorMessage(err, 'Failed to exit current trial'))
         return
       }
+    }
+
+    if (sequenceRunType === 'final') {
+      setParticipantStage('final-complete')
+      setFinalSequenceExitedEarly(true)
+      setPulls([])
+      setBanditMeans([])
+      setSessionId('')
+      setMetrics(null)
+      setRounds(0)
+      setPendingNextIndex(null)
+      setJustCompletedExperimentLabel('')
+      setActiveExperimentLabel('')
+      setPullInProgress(false)
+      setActiveArmIndex(null)
+      setLatestPullFeedback(null)
+      setShowGroupInstruction(false)
+      setGroupInstruction('')
+      setError(
+        'You exited the current experiment. Completed experiments were saved; the current one was discarded.'
+      )
+      return
     }
 
     reset()
@@ -808,6 +854,7 @@ function App() {
       } else if (sequenceRunType === 'practice') {
         setParticipantStage('run-result')
       } else {
+        setFinalSequenceExitedEarly(false)
         setParticipantStage('final-complete')
       }
     } catch (err) {
@@ -826,11 +873,15 @@ function App() {
     setSessionId('')
     setMetrics(null)
     setRounds(0)
+    setExitAllowed(true)
+    setShowGroupInstruction(false)
+    setGroupInstruction('')
     setSequenceExperiments([])
     setSequenceIndex(0)
     setPendingNextIndex(null)
     setJustCompletedExperimentLabel('')
     setFinalExperimentSummaries([])
+    setFinalSequenceExitedEarly(false)
     setActiveExperimentLabel('')
     setActiveParticipantId('')
     setPullInProgress(false)
@@ -865,7 +916,11 @@ function App() {
 
   function updateGroupDetailToggle(
     group: ABGroup,
-    key: 'showRoundHistory' | 'showArmPullCounts' | 'showCurrentArmProbabilities',
+    key:
+      | 'showRoundHistory'
+      | 'showArmPullCounts'
+      | 'showCurrentArmProbabilities'
+      | 'showCustomInstruction',
     value: boolean
   ) {
     if (!adminConfig) {
@@ -879,6 +934,23 @@ function App() {
         [group]: {
           ...adminConfig.groupConfigs[group],
           [key]: value,
+        },
+      },
+    })
+  }
+
+  function updateGroupCustomInstruction(group: ABGroup, value: string) {
+    if (!adminConfig) {
+      return
+    }
+
+    setAdminConfig({
+      ...adminConfig,
+      groupConfigs: {
+        ...adminConfig.groupConfigs,
+        [group]: {
+          ...adminConfig.groupConfigs[group],
+          customInstruction: value,
         },
       },
     })
@@ -1142,14 +1214,28 @@ function App() {
         <section className="panel">
           <div className="panel-header-row">
             <h2>{runType === 'practice' ? 'Practice Run' : 'Final Run'}</h2>
-            <p>
-              Round {currentRound + 1} / {rounds}
-            </p>
+            <div className="panel-header-actions">
+              <p>
+                Round {currentRound + 1} / {rounds}
+              </p>
+              {exitAllowed && (
+                <button
+                  className="danger-button"
+                  onClick={() => void exitCurrentTrial()}
+                  disabled={saving}
+                >
+                  Exit Trial
+                </button>
+              )}
+            </div>
           </div>
 
           <p className="setup-note">
             Experiment: {activeExperimentLabel || 'Selected experiment'}
           </p>
+          {showGroupInstruction && groupInstruction.trim().length > 0 && (
+            <p className="setup-note">Group note: {groupInstruction}</p>
+          )}
           {sequenceExperiments.length > 0 && (
             <p className="setup-note">
               Experiment progress: {sequenceIndex + 1} / {sequenceExperiments.length}
@@ -1235,16 +1321,6 @@ function App() {
               </div>
             </section>
           )}
-
-          <div className="action-row">
-            <button
-              className="danger-button"
-              onClick={() => void exitCurrentTrial()}
-              disabled={saving}
-            >
-              Exit Trial
-            </button>
-          </div>
         </section>
       )}
 
@@ -1278,55 +1354,75 @@ function App() {
           <p className="setup-note">
             Practice trial complete. You can now start the final sequence.
           </p>
-          <button className="primary-button" onClick={() => startSession('final')}>
-            Start Final Trial (All Experiments)
-          </button>
+          <div className="action-row">
+            <button className="primary-button" onClick={() => startSession('final')}>
+              Start Final Trial (All Experiments)
+            </button>
+            <button className="ghost-button" onClick={reset}>
+              Back to Main Page
+            </button>
+          </div>
         </section>
       )}
 
-      {mode === 'participant' && participantStage === 'final-complete' && metrics && (
+      {mode === 'participant' && participantStage === 'final-complete' && (
         <section className="panel">
-          <h2>Final Trial Complete</h2>
-          <p className="setup-note">Summary across all final experiments:</p>
-
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Experiment</th>
-                  <th>Total Reward</th>
-                  <th>Avg Reward</th>
-                  <th>Expected Regret</th>
-                  <th>Unique Arms</th>
-                </tr>
-              </thead>
-              <tbody>
-                {finalExperimentSummaries.map((row, rowIndex) => (
-                  <tr key={`${row.experimentLabel}-${rowIndex}`}>
-                    <td>{row.experimentLabel}</td>
-                    <td>{format(row.totalReward)}</td>
-                    <td>{format(row.averageReward)}</td>
-                    <td>{format(row.expectedRegret)}</td>
-                    <td>{row.uniqueArmsChosen}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <ul className="metrics-list">
-            <li>Combined total reward: {format(finalSummaryTotals.totalReward)}</li>
-            <li>Mean average reward: {format(finalSummaryTotals.meanAverageReward)}</li>
-            <li>Combined expected regret: {format(finalSummaryTotals.totalExpectedRegret)}</li>
-          </ul>
-
+          <h2>{finalSequenceExitedEarly ? 'Final Trial Ended Early' : 'Final Trial Complete'}</h2>
           <p className="setup-note">
-            Final sequence complete. Last session id: {sessionId}.
+            {finalExperimentSummaries.length > 0
+              ? 'Summary across completed final experiments:'
+              : 'No final experiment was completed before exiting.'}
           </p>
 
-          <button className="primary-button" onClick={reset}>
-            Start New Participant Session
-          </button>
+          {finalExperimentSummaries.length > 0 && (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Experiment</th>
+                    <th>Total Reward</th>
+                    <th>Avg Reward</th>
+                    <th>Expected Regret</th>
+                    <th>Unique Arms</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {finalExperimentSummaries.map((row, rowIndex) => (
+                    <tr key={`${row.experimentLabel}-${rowIndex}`}>
+                      <td>{row.experimentLabel}</td>
+                      <td>{format(row.totalReward)}</td>
+                      <td>{format(row.averageReward)}</td>
+                      <td>{format(row.expectedRegret)}</td>
+                      <td>{row.uniqueArmsChosen}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {finalExperimentSummaries.length > 0 && (
+            <ul className="metrics-list">
+              <li>Combined total reward: {format(finalSummaryTotals.totalReward)}</li>
+              <li>Mean average reward: {format(finalSummaryTotals.meanAverageReward)}</li>
+              <li>Combined expected regret: {format(finalSummaryTotals.totalExpectedRegret)}</li>
+            </ul>
+          )}
+
+          <p className="setup-note">
+            {finalSequenceExitedEarly
+              ? 'Exited during the current experiment. Previously completed experiments remain saved.'
+              : 'Final sequence complete.'}
+          </p>
+
+          <div className="action-row">
+            <button className="primary-button" onClick={reset}>
+              Start New Participant Session
+            </button>
+            <button className="ghost-button" onClick={reset}>
+              Back to Main Page
+            </button>
+          </div>
         </section>
       )}
 
@@ -1360,10 +1456,10 @@ function App() {
               </button>
               <button
                 className="secondary-button"
-                onClick={() => void exportFourConfiguredCsvs()}
+                onClick={() => void exportExperimentCsvs()}
                 disabled={adminExporting}
               >
-                {adminExporting ? 'Exporting CSVs...' : 'Export 4 CSVs'}
+                {adminExporting ? 'Exporting CSVs...' : 'Export Experiment CSVs'}
               </button>
               <button className="secondary-button" onClick={refreshAdminData}>
                 Refresh Data
@@ -1388,6 +1484,16 @@ function App() {
               <select
                 value={adminConfig.practiceEnabled ? 'yes' : 'no'}
                 onChange={(event) => updateAdminConfig('practiceEnabled', event.target.value === 'yes')}
+              >
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </label>
+            <label>
+              Allow participant exit
+              <select
+                value={adminConfig.exitAllowed ? 'yes' : 'no'}
+                onChange={(event) => updateAdminConfig('exitAllowed', event.target.value === 'yes')}
               >
                 <option value="yes">Yes</option>
                 <option value="no">No</option>
@@ -1688,6 +1794,32 @@ function App() {
                   <option value="no">No</option>
                 </select>
               </label>
+
+              <label>
+                Show custom in-experiment instruction
+                <select
+                  value={adminConfig.groupConfigs.A.showCustomInstruction ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle(
+                      'A',
+                      'showCustomInstruction',
+                      event.target.value === 'yes'
+                    )
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+
+              <label>
+                Custom instruction text
+                <textarea
+                  rows={3}
+                  value={adminConfig.groupConfigs.A.customInstruction}
+                  onChange={(event) => updateGroupCustomInstruction('A', event.target.value)}
+                />
+              </label>
             </article>
 
             <article className="arm-card">
@@ -1748,6 +1880,32 @@ function App() {
                   <option value="yes">Yes</option>
                   <option value="no">No</option>
                 </select>
+              </label>
+
+              <label>
+                Show custom in-experiment instruction
+                <select
+                  value={adminConfig.groupConfigs.B.showCustomInstruction ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle(
+                      'B',
+                      'showCustomInstruction',
+                      event.target.value === 'yes'
+                    )
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+
+              <label>
+                Custom instruction text
+                <textarea
+                  rows={3}
+                  value={adminConfig.groupConfigs.B.customInstruction}
+                  onChange={(event) => updateGroupCustomInstruction('B', event.target.value)}
+                />
               </label>
             </article>
           </div>

@@ -158,6 +158,17 @@ textarea:focus {
   flex-wrap: wrap;
 }
 
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.panel-header-actions p {
+  margin: 0;
+}
+
 .condition-pill {
   display: inline-block;
   margin: 0.75rem 0;

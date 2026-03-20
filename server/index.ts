@@ -11,9 +11,12 @@ type SessionSettings = {
   numArms: number
   rounds: number
   visibilityMode: VisibilityMode
+  exitAllowed: boolean
   showRoundHistory: boolean
   showArmPullCounts: boolean
   showCurrentArmProbabilities: boolean
+  showGroupInstruction: boolean
+  groupInstruction: string
 }
 
 type ABGroup = 'A' | 'B'
@@ -39,6 +42,7 @@ type ExperimentConfig = {
   title: string
   purpose: string
   instructions: string
+  exitAllowed: boolean
   maxFinalExperimentsPerParticipant: number
   experiments: ExperimentDefinition[]
   practiceEnabled: boolean
@@ -51,12 +55,16 @@ type ExperimentConfig = {
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
     B: {
       visibilityMode: VisibilityMode
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
   }
 }
@@ -286,33 +294,44 @@ function getExperimentConfig(): ExperimentConfig {
     title: String(raw.title ?? 'Bandit Decision-Making Study'),
     purpose: String(
       raw.purpose ??
-        'This study examines how people learn from rewards while making repeated decisions.'
+        'This experiment studies how people learn from feedback under uncertainty and how different information views affect decision quality over repeated rounds.'
     ),
     instructions: String(
       raw.instructions ??
-        'In each round, choose one arm. Rewards are either 0 or 1. Try to maximize your total reward.'
+        'Your aim is to maximize total reward by selecting one arm per round. Rewards are binary (0 or 1). Some arms are better than others, so use feedback from earlier rounds to improve your choices.'
     ),
-      maxFinalExperimentsPerParticipant,
-      experiments: normalizedExperiments.length > 0 ? normalizedExperiments : [fallbackExperiment],
+    exitAllowed: Boolean(raw.exitAllowed ?? true),
+    maxFinalExperimentsPerParticipant,
+    experiments: normalizedExperiments.length > 0 ? normalizedExperiments : [fallbackExperiment],
     practiceEnabled: Boolean(raw.practiceEnabled ?? true),
     practiceConfig: normalizePracticeConfig(raw.practiceConfig),
     abTestingEnabled: Boolean(raw.abTestingEnabled ?? true),
-    defaultVisibilityMode: (raw.defaultVisibilityMode as VisibilityMode) ?? 'last-3',
+    defaultVisibilityMode: (raw.defaultVisibilityMode as VisibilityMode) ?? 'none',
     groupConfigs: {
       A: {
-        visibilityMode: (raw.groupConfigs?.A?.visibilityMode as VisibilityMode) ?? 'full',
-        showRoundHistory: Boolean(raw.groupConfigs?.A?.showRoundHistory ?? true),
-        showArmPullCounts: Boolean(raw.groupConfigs?.A?.showArmPullCounts ?? true),
+        visibilityMode: (raw.groupConfigs?.A?.visibilityMode as VisibilityMode) ?? 'none',
+        showRoundHistory: Boolean(raw.groupConfigs?.A?.showRoundHistory ?? false),
+        showArmPullCounts: Boolean(raw.groupConfigs?.A?.showArmPullCounts ?? false),
         showCurrentArmProbabilities: Boolean(
           raw.groupConfigs?.A?.showCurrentArmProbabilities ?? false
         ),
+        showCustomInstruction: Boolean(raw.groupConfigs?.A?.showCustomInstruction ?? true),
+        customInstruction: String(
+          raw.groupConfigs?.A?.customInstruction ??
+            'Group A condition: minimal feedback view. Focus on learning from immediate outcomes and strategy over time to maximize reward.'
+        ),
       },
       B: {
-        visibilityMode: (raw.groupConfigs?.B?.visibilityMode as VisibilityMode) ?? 'last-3',
-        showRoundHistory: Boolean(raw.groupConfigs?.B?.showRoundHistory ?? false),
+        visibilityMode: (raw.groupConfigs?.B?.visibilityMode as VisibilityMode) ?? 'full',
+        showRoundHistory: Boolean(raw.groupConfigs?.B?.showRoundHistory ?? true),
         showArmPullCounts: Boolean(raw.groupConfigs?.B?.showArmPullCounts ?? true),
         showCurrentArmProbabilities: Boolean(
-          raw.groupConfigs?.B?.showCurrentArmProbabilities ?? false
+          raw.groupConfigs?.B?.showCurrentArmProbabilities ?? true
+        ),
+        showCustomInstruction: Boolean(raw.groupConfigs?.B?.showCustomInstruction ?? true),
+        customInstruction: String(
+          raw.groupConfigs?.B?.customInstruction ??
+            'Group B condition: full feedback view. Use round history, pull counts, and displayed reward probabilities to optimize your selections.'
         ),
       },
     },
@@ -387,6 +406,9 @@ function validateExperimentConfig(config: ExperimentConfig): string | null {
   }
   if (!config.instructions?.trim()) {
     return 'instructions are required'
+  }
+  if (typeof config.exitAllowed !== 'boolean') {
+    return 'exitAllowed must be boolean'
   }
   if (
     !Number.isInteger(config.maxFinalExperimentsPerParticipant) ||
@@ -480,6 +502,18 @@ function validateExperimentConfig(config: ExperimentConfig): string | null {
   }
   if (typeof config.groupConfigs?.B?.showCurrentArmProbabilities !== 'boolean') {
     return 'groupConfigs.B.showCurrentArmProbabilities must be boolean'
+  }
+  if (typeof config.groupConfigs?.A?.showCustomInstruction !== 'boolean') {
+    return 'groupConfigs.A.showCustomInstruction must be boolean'
+  }
+  if (typeof config.groupConfigs?.B?.showCustomInstruction !== 'boolean') {
+    return 'groupConfigs.B.showCustomInstruction must be boolean'
+  }
+  if (typeof config.groupConfigs?.A?.customInstruction !== 'string') {
+    return 'groupConfigs.A.customInstruction must be a string'
+  }
+  if (typeof config.groupConfigs?.B?.customInstruction !== 'string') {
+    return 'groupConfigs.B.customInstruction must be a string'
   }
   return null
 }
@@ -760,6 +794,7 @@ app.get('/api/admin/export/experiment/:experimentId', requireAdminToken, (req, r
        FROM sessions s
        INNER JOIN pulls p ON p.session_id = s.id
        WHERE s.experiment_id = ?
+         AND s.run_type = 'final'
        ORDER BY s.created_at ASC, p.round_index ASC`
     )
     .all(experimentId) as ExportPullRow[]
@@ -945,9 +980,12 @@ app.post('/api/sessions/start', (req, res) => {
     numArms,
     rounds,
     visibilityMode,
+    exitAllowed: config.exitAllowed,
     showRoundHistory: config.groupConfigs[abGroup].showRoundHistory,
     showArmPullCounts: config.groupConfigs[abGroup].showArmPullCounts,
     showCurrentArmProbabilities: config.groupConfigs[abGroup].showCurrentArmProbabilities,
+    showGroupInstruction: config.groupConfigs[abGroup].showCustomInstruction,
+    groupInstruction: config.groupConfigs[abGroup].customInstruction,
   }
 
   insertSession.run({
@@ -1086,8 +1124,8 @@ app.post('/api/sessions/:sessionId/abort', (req, res) => {
   const participantId = normalizeParticipantId(req.body?.participantId)
 
   const sessionRow = db
-    .prepare('SELECT id, participant_id FROM sessions WHERE id = ?')
-    .get(sessionId) as { id: string; participant_id: string | null } | undefined
+    .prepare('SELECT id, participant_id, settings_json FROM sessions WHERE id = ?')
+    .get(sessionId) as { id: string; participant_id: string | null; settings_json: string } | undefined
 
   if (!sessionRow) {
     res.status(404).json({ error: 'Session not found.' })
@@ -1105,6 +1143,12 @@ app.post('/api/sessions/:sessionId/abort', (req, res) => {
 
   if (metricsRow) {
     res.status(409).json({ error: 'Completed sessions cannot be aborted.' })
+    return
+  }
+
+  const settings = parseSessionSettings({ settings_json: sessionRow.settings_json })
+  if (!settings.exitAllowed) {
+    res.status(403).json({ error: 'Exit is disabled for this experiment.' })
     return
   }
 
