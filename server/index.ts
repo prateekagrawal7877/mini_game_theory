@@ -1316,6 +1316,10 @@ app.post('/api/sessions/:sessionId/abort', (req, res) => {
   res.json({ ok: true, abortedSessionId: sessionId })
 })
 
-app.listen(port, () => {
-  console.log(`Bandit API running on http://localhost:${port}`)
-})
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Bandit API running on http://localhost:${port}`)
+  })
+}
+
+export default app
