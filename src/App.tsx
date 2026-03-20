@@ -57,6 +57,7 @@ type ExperimentBrief = {
   title: string
   purpose: string
   instructions: string
+  exitAllowed: boolean
   practiceEnabled: boolean
   practiceConfig: PracticeConfig
   maxFinalExperimentsPerParticipant: number
@@ -66,11 +67,15 @@ type ExperimentBrief = {
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
     B: {
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
   }
 }
@@ -83,9 +88,12 @@ type SessionStartResponse = {
     numArms: number
     rounds: number
     visibilityMode: VisibilityMode
+    exitAllowed: boolean
     showRoundHistory: boolean
     showArmPullCounts: boolean
     showCurrentArmProbabilities: boolean
+    showGroupInstruction: boolean
+    groupInstruction: string
   }
   banditMeans: number[]
   experiment: {
@@ -100,6 +108,7 @@ type ExperimentConfig = {
   title: string
   purpose: string
   instructions: string
+  exitAllowed: boolean
   maxFinalExperimentsPerParticipant: number
   experiments: ExperimentDefinition[]
   practiceEnabled: boolean
@@ -112,12 +121,16 @@ type ExperimentConfig = {
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
     B: {
       visibilityMode: VisibilityMode
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
   }
 }
@@ -138,6 +151,10 @@ type AdminSessionRow = {
 
 function format(value: number): string {
   return value.toFixed(3)
+}
+
+function normalizeParticipantIdentifier(value: string): string {
+  return value.trim().toLowerCase()
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T | null> {
@@ -185,6 +202,11 @@ function App() {
   const [participantStage, setParticipantStage] = useState<ParticipantStage>('loading')
   const [experimentBrief, setExperimentBrief] = useState<ExperimentBrief | null>(null)
   const [participantId, setParticipantId] = useState<string>('')
+  const [participantOtp, setParticipantOtp] = useState<string>('')
+  const [participantOtpRequested, setParticipantOtpRequested] = useState<boolean>(false)
+  const [participantVerified, setParticipantVerified] = useState<boolean>(false)
+  const [participantLoginToken, setParticipantLoginToken] = useState<string>('')
+  const [authBusy, setAuthBusy] = useState<boolean>(false)
   const [activeParticipantId, setActiveParticipantId] = useState<string>('')
   const [sequenceExperiments, setSequenceExperiments] = useState<ExperimentDefinition[]>([])
   const [sequenceIndex, setSequenceIndex] = useState<number>(0)
@@ -192,13 +214,17 @@ function App() {
   const [justCompletedExperimentLabel, setJustCompletedExperimentLabel] = useState<string>('')
   const [sequenceRunType, setSequenceRunType] = useState<RunType>('final')
   const [finalExperimentSummaries, setFinalExperimentSummaries] = useState<FinalExperimentSummary[]>([])
+  const [finalSequenceExitedEarly, setFinalSequenceExitedEarly] = useState<boolean>(false)
   const [activeExperimentLabel, setActiveExperimentLabel] = useState<string>('')
 
   const [numArms, setNumArms] = useState<number>(2)
   const [rounds, setRounds] = useState<number>(0)
+  const [exitAllowed, setExitAllowed] = useState<boolean>(true)
   const [showRoundHistory, setShowRoundHistory] = useState<boolean>(false)
   const [showArmPullCounts, setShowArmPullCounts] = useState<boolean>(false)
   const [showCurrentArmProbabilities, setShowCurrentArmProbabilities] = useState<boolean>(false)
+  const [showGroupInstruction, setShowGroupInstruction] = useState<boolean>(false)
+  const [groupInstruction, setGroupInstruction] = useState<string>('')
   const [runType, setRunType] = useState<RunType>('final')
 
   const [sessionId, setSessionId] = useState<string>('')
@@ -311,6 +337,30 @@ function App() {
       }
     }
   }, [])
+
+  useEffect(() => {
+    if (!error) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      setError('')
+    }, 7000)
+
+    return () => window.clearTimeout(timer)
+  }, [error])
+
+  useEffect(() => {
+    if (!adminMessage) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      setAdminMessage('')
+    }, 7000)
+
+    return () => window.clearTimeout(timer)
+  }, [adminMessage])
 
   async function loadAdminData(token: string) {
     const [configResponse, sessionsResponse] = await Promise.all([
@@ -494,7 +544,7 @@ function App() {
     window.URL.revokeObjectURL(url)
   }
 
-  async function exportFourConfiguredCsvs() {
+  async function exportExperimentCsvs() {
     if (!adminConfig || adminExporting) {
       return
     }
@@ -504,21 +554,24 @@ function App() {
     setAdminMessage('')
 
     try {
-      const experiment1Id = adminConfig.experiments[0]?.id ?? 'exp_1'
-      const experiment2Id = adminConfig.experiments[1]?.id ?? 'exp_2'
+      const enabledExperimentIds = adminConfig.experiments
+        .filter((experiment) => experiment.enabled)
+        .map((experiment) => experiment.id)
 
-      await downloadAdminCsv('/api/admin/export/group/A', 'group_A_pull_history.csv')
-      await downloadAdminCsv('/api/admin/export/group/B', 'group_B_pull_history.csv')
-      await downloadAdminCsv(
-        `/api/admin/export/experiment/${encodeURIComponent(experiment1Id)}`,
-        `experiment_${experiment1Id}_pull_history.csv`
-      )
-      await downloadAdminCsv(
-        `/api/admin/export/experiment/${encodeURIComponent(experiment2Id)}`,
-        `experiment_${experiment2Id}_pull_history.csv`
-      )
+      if (enabledExperimentIds.length === 0) {
+        throw new Error('No enabled experiments found to export.')
+      }
 
-      setAdminMessage('Exported 4 CSV files: Group A, Group B, Experiment 1, Experiment 2.')
+      for (const experimentId of enabledExperimentIds) {
+        await downloadAdminCsv(
+          `/api/admin/export/experiment/${encodeURIComponent(experimentId)}`,
+          `experiment_${experimentId}_pull_history.csv`
+        )
+      }
+
+      setAdminMessage(
+        `Exported ${enabledExperimentIds.length} CSV file(s), one per experiment with A/B group labels included.`
+      )
     } catch (err) {
       setError(toUserErrorMessage(err, 'Failed to export CSV files'))
     } finally {
@@ -539,6 +592,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           participantId: normalizedParticipantId,
+          loginToken: participantLoginToken,
           experimentId: experiment?.id,
           runType: nextRunType,
         }),
@@ -557,9 +611,12 @@ function App() {
       setSessionId(data.sessionId)
       setNumArms(data.settings.numArms)
       setRounds(data.settings.rounds)
+      setExitAllowed(data.settings.exitAllowed)
       setShowRoundHistory(data.settings.showRoundHistory)
       setShowArmPullCounts(data.settings.showArmPullCounts)
       setShowCurrentArmProbabilities(data.settings.showCurrentArmProbabilities)
+      setShowGroupInstruction(data.settings.showGroupInstruction)
+      setGroupInstruction(data.settings.groupInstruction)
       setActiveExperimentLabel(data.settings.experimentLabel)
       setBanditMeans(data.banditMeans)
       setRunType(data.runType)
@@ -577,15 +634,16 @@ function App() {
   }
 
   async function startSession(nextRunType: RunType) {
-    const normalizedParticipantId = participantId.trim().toUpperCase()
+    const normalizedParticipantId = normalizeParticipantIdentifier(participantId)
 
-    if (!/^[A-Z0-9_-]{4,32}$/.test(normalizedParticipantId)) {
-      setError('Participant ID is required. Use 4-32 chars: letters, numbers, _ or -.')
+    if (!participantVerified || !participantLoginToken) {
+      setError('Please verify your email with OTP before starting the experiment.')
       return
     }
 
     setActiveParticipantId(normalizedParticipantId)
     setSequenceRunType(nextRunType)
+    setFinalSequenceExitedEarly(false)
     setPendingNextIndex(null)
     setJustCompletedExperimentLabel('')
 
@@ -664,7 +722,7 @@ function App() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            participantId: activeParticipantId || participantId.trim().toUpperCase(),
+            participantId: activeParticipantId || normalizeParticipantIdentifier(participantId),
           }),
         })
 
@@ -676,6 +734,28 @@ function App() {
         setError(toUserErrorMessage(err, 'Failed to exit current trial'))
         return
       }
+    }
+
+    if (sequenceRunType === 'final') {
+      setParticipantStage('final-complete')
+      setFinalSequenceExitedEarly(true)
+      setPulls([])
+      setBanditMeans([])
+      setSessionId('')
+      setMetrics(null)
+      setRounds(0)
+      setPendingNextIndex(null)
+      setJustCompletedExperimentLabel('')
+      setActiveExperimentLabel('')
+      setPullInProgress(false)
+      setActiveArmIndex(null)
+      setLatestPullFeedback(null)
+      setShowGroupInstruction(false)
+      setGroupInstruction('')
+      setError(
+        'You exited the current experiment. Completed experiments were saved; the current one was discarded.'
+      )
+      return
     }
 
     reset()
@@ -808,6 +888,7 @@ function App() {
       } else if (sequenceRunType === 'practice') {
         setParticipantStage('run-result')
       } else {
+        setFinalSequenceExitedEarly(false)
         setParticipantStage('final-complete')
       }
     } catch (err) {
@@ -826,17 +907,109 @@ function App() {
     setSessionId('')
     setMetrics(null)
     setRounds(0)
+    setExitAllowed(true)
+    setShowGroupInstruction(false)
+    setGroupInstruction('')
     setSequenceExperiments([])
     setSequenceIndex(0)
     setPendingNextIndex(null)
     setJustCompletedExperimentLabel('')
     setFinalExperimentSummaries([])
+    setFinalSequenceExitedEarly(false)
     setActiveExperimentLabel('')
     setActiveParticipantId('')
     setPullInProgress(false)
     setActiveArmIndex(null)
     setLatestPullFeedback(null)
     setError('')
+  }
+
+  async function requestParticipantOtp() {
+    const normalizedParticipantId = normalizeParticipantIdentifier(participantId)
+    if (!normalizedParticipantId) {
+      setError('Please enter your email first.')
+      return
+    }
+
+    try {
+      setAuthBusy(true)
+      setError('')
+
+      const response = await fetch('/api/auth/request-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: normalizedParticipantId }),
+      })
+
+      const data = await parseJsonResponse<{ error?: string; warning?: string }>(response)
+      if (!response.ok) {
+        throw new Error(buildHttpErrorMessage(data, 'Failed to request OTP', response))
+      }
+
+      setParticipantOtpRequested(true)
+      setParticipantVerified(false)
+      setParticipantLoginToken('')
+
+      if (data?.warning) {
+        setAdminMessage(`${data.warning} Please retry in a moment or use the tester account.`)
+      } else {
+        setAdminMessage('OTP sent. Please check your email and enter the code below.')
+      }
+    } catch (err) {
+      setError(toUserErrorMessage(err, 'Failed to request OTP'))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function verifyParticipantOtp() {
+    const normalizedParticipantId = normalizeParticipantIdentifier(participantId)
+    const normalizedOtp = participantOtp.trim()
+
+    if (!normalizedParticipantId || !normalizedOtp) {
+      setError('Enter both email and OTP code to verify.')
+      return
+    }
+
+    try {
+      setAuthBusy(true)
+      setError('')
+
+      const response = await fetch('/api/auth/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: normalizedParticipantId,
+          otp: normalizedOtp,
+        }),
+      })
+
+      const data = await parseJsonResponse<{
+        error?: string
+        participantId?: string
+        loginToken?: string
+      }>(response)
+
+      if (!response.ok) {
+        throw new Error(buildHttpErrorMessage(data, 'Failed to verify OTP', response))
+      }
+
+      if (!data?.participantId || !data?.loginToken) {
+        throw new Error('Invalid OTP verification response from server.')
+      }
+
+      setParticipantId(data.participantId)
+      setActiveParticipantId(data.participantId)
+      setParticipantLoginToken(data.loginToken)
+      setParticipantVerified(true)
+      setAdminMessage('Email verified. You can now start the experiment.')
+    } catch (err) {
+      setParticipantVerified(false)
+      setParticipantLoginToken('')
+      setError(toUserErrorMessage(err, 'Failed to verify OTP'))
+    } finally {
+      setAuthBusy(false)
+    }
   }
 
   function updateAdminConfig<K extends keyof ExperimentConfig>(key: K, value: ExperimentConfig[K]) {
@@ -865,7 +1038,11 @@ function App() {
 
   function updateGroupDetailToggle(
     group: ABGroup,
-    key: 'showRoundHistory' | 'showArmPullCounts' | 'showCurrentArmProbabilities',
+    key:
+      | 'showRoundHistory'
+      | 'showArmPullCounts'
+      | 'showCurrentArmProbabilities'
+      | 'showCustomInstruction',
     value: boolean
   ) {
     if (!adminConfig) {
@@ -879,6 +1056,23 @@ function App() {
         [group]: {
           ...adminConfig.groupConfigs[group],
           [key]: value,
+        },
+      },
+    })
+  }
+
+  function updateGroupCustomInstruction(group: ABGroup, value: string) {
+    if (!adminConfig) {
+      return
+    }
+
+    setAdminConfig({
+      ...adminConfig,
+      groupConfigs: {
+        ...adminConfig.groupConfigs,
+        [group]: {
+          ...adminConfig.groupConfigs[group],
+          customInstruction: value,
         },
       },
     })
@@ -1084,8 +1278,32 @@ function App() {
         </div>
       </section>
 
-      {error && <p className="error-banner">{error}</p>}
-      {adminMessage && <p className="ok-banner">{adminMessage}</p>}
+      {error && (
+        <div className="error-banner">
+          <span>{error}</span>
+          <button
+            type="button"
+            className="banner-close-button"
+            onClick={() => setError('')}
+            aria-label="Dismiss error message"
+          >
+            x
+          </button>
+        </div>
+      )}
+      {adminMessage && (
+        <div className="ok-banner">
+          <span>{adminMessage}</span>
+          <button
+            type="button"
+            className="banner-close-button"
+            onClick={() => setAdminMessage('')}
+            aria-label="Dismiss notification"
+          >
+            x
+          </button>
+        </div>
+      )}
 
       {mode === 'participant' && participantStage === 'loading' && (
         <section className="panel">
@@ -1101,13 +1319,52 @@ function App() {
           <p className="question-text">Instructions: {experimentBrief.instructions}</p>
 
           <label>
-            Participant ID (required)
+            Email (required)
             <input
+              type="text"
               value={participantId}
-              onChange={(event) => setParticipantId(event.target.value)}
-              placeholder="e.g. P_0142"
+              onChange={(event) => {
+                setParticipantId(event.target.value)
+                setParticipantVerified(false)
+                setParticipantLoginToken('')
+              }}
+              placeholder="e.g. user@example.com"
             />
           </label>
+
+          <div className="action-row">
+            <button
+              className="secondary-button"
+              onClick={() => void requestParticipantOtp()}
+              disabled={authBusy}
+            >
+              {authBusy ? 'Please wait...' : 'Send OTP'}
+            </button>
+          </div>
+
+          {participantOtpRequested && (
+            <>
+              <label>
+                Enter OTP
+                <input
+                  value={participantOtp}
+                  onChange={(event) => setParticipantOtp(event.target.value)}
+                  placeholder="6-digit OTP"
+                />
+              </label>
+              <div className="action-row">
+                <button
+                  className="secondary-button"
+                  onClick={() => void verifyParticipantOtp()}
+                  disabled={authBusy}
+                >
+                  Verify OTP
+                </button>
+              </div>
+            </>
+          )}
+
+          {participantVerified && <p className="ok-banner">Email verified successfully.</p>}
 
           {experimentBrief.experiments.length === 0 && (
             <p className="setup-note">No enabled experiments are currently available.</p>
@@ -1123,6 +1380,7 @@ function App() {
               <button
                 className="secondary-button"
                 onClick={() => startSession('practice')}
+                disabled={!participantVerified || !participantLoginToken}
               >
                 Start Practice Trial
               </button>
@@ -1130,7 +1388,7 @@ function App() {
             <button
               className="primary-button"
               onClick={() => startSession('final')}
-              disabled={experimentBrief.experiments.length === 0}
+              disabled={experimentBrief.experiments.length === 0 || !participantVerified || !participantLoginToken}
             >
               Start Final Trial (All Experiments)
             </button>
@@ -1142,14 +1400,28 @@ function App() {
         <section className="panel">
           <div className="panel-header-row">
             <h2>{runType === 'practice' ? 'Practice Run' : 'Final Run'}</h2>
-            <p>
-              Round {currentRound + 1} / {rounds}
-            </p>
+            <div className="panel-header-actions">
+              <p>
+                Round {currentRound + 1} / {rounds}
+              </p>
+              {exitAllowed && (
+                <button
+                  className="danger-button"
+                  onClick={() => void exitCurrentTrial()}
+                  disabled={saving}
+                >
+                  Exit Trial
+                </button>
+              )}
+            </div>
           </div>
 
           <p className="setup-note">
             Experiment: {activeExperimentLabel || 'Selected experiment'}
           </p>
+          {showGroupInstruction && groupInstruction.trim().length > 0 && (
+            <p className="setup-note">Group note: {groupInstruction}</p>
+          )}
           {sequenceExperiments.length > 0 && (
             <p className="setup-note">
               Experiment progress: {sequenceIndex + 1} / {sequenceExperiments.length}
@@ -1235,16 +1507,6 @@ function App() {
               </div>
             </section>
           )}
-
-          <div className="action-row">
-            <button
-              className="danger-button"
-              onClick={() => void exitCurrentTrial()}
-              disabled={saving}
-            >
-              Exit Trial
-            </button>
-          </div>
         </section>
       )}
 
@@ -1278,55 +1540,75 @@ function App() {
           <p className="setup-note">
             Practice trial complete. You can now start the final sequence.
           </p>
-          <button className="primary-button" onClick={() => startSession('final')}>
-            Start Final Trial (All Experiments)
-          </button>
+          <div className="action-row">
+            <button className="primary-button" onClick={() => startSession('final')}>
+              Start Final Trial (All Experiments)
+            </button>
+            <button className="ghost-button" onClick={reset}>
+              Back to Main Page
+            </button>
+          </div>
         </section>
       )}
 
-      {mode === 'participant' && participantStage === 'final-complete' && metrics && (
+      {mode === 'participant' && participantStage === 'final-complete' && (
         <section className="panel">
-          <h2>Final Trial Complete</h2>
-          <p className="setup-note">Summary across all final experiments:</p>
-
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Experiment</th>
-                  <th>Total Reward</th>
-                  <th>Avg Reward</th>
-                  <th>Expected Regret</th>
-                  <th>Unique Arms</th>
-                </tr>
-              </thead>
-              <tbody>
-                {finalExperimentSummaries.map((row, rowIndex) => (
-                  <tr key={`${row.experimentLabel}-${rowIndex}`}>
-                    <td>{row.experimentLabel}</td>
-                    <td>{format(row.totalReward)}</td>
-                    <td>{format(row.averageReward)}</td>
-                    <td>{format(row.expectedRegret)}</td>
-                    <td>{row.uniqueArmsChosen}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <ul className="metrics-list">
-            <li>Combined total reward: {format(finalSummaryTotals.totalReward)}</li>
-            <li>Mean average reward: {format(finalSummaryTotals.meanAverageReward)}</li>
-            <li>Combined expected regret: {format(finalSummaryTotals.totalExpectedRegret)}</li>
-          </ul>
-
+          <h2>{finalSequenceExitedEarly ? 'Final Trial Ended Early' : 'Final Trial Complete'}</h2>
           <p className="setup-note">
-            Final sequence complete. Last session id: {sessionId}.
+            {finalExperimentSummaries.length > 0
+              ? 'Summary across completed final experiments:'
+              : 'No final experiment was completed before exiting.'}
           </p>
 
-          <button className="primary-button" onClick={reset}>
-            Start New Participant Session
-          </button>
+          {finalExperimentSummaries.length > 0 && (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Experiment</th>
+                    <th>Total Reward</th>
+                    <th>Avg Reward</th>
+                    <th>Expected Regret</th>
+                    <th>Unique Arms</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {finalExperimentSummaries.map((row, rowIndex) => (
+                    <tr key={`${row.experimentLabel}-${rowIndex}`}>
+                      <td>{row.experimentLabel}</td>
+                      <td>{format(row.totalReward)}</td>
+                      <td>{format(row.averageReward)}</td>
+                      <td>{format(row.expectedRegret)}</td>
+                      <td>{row.uniqueArmsChosen}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {finalExperimentSummaries.length > 0 && (
+            <ul className="metrics-list">
+              <li>Combined total reward: {format(finalSummaryTotals.totalReward)}</li>
+              <li>Mean average reward: {format(finalSummaryTotals.meanAverageReward)}</li>
+              <li>Combined expected regret: {format(finalSummaryTotals.totalExpectedRegret)}</li>
+            </ul>
+          )}
+
+          <p className="setup-note">
+            {finalSequenceExitedEarly
+              ? 'Exited during the current experiment. Previously completed experiments remain saved.'
+              : 'Final sequence complete.'}
+          </p>
+
+          <div className="action-row">
+            <button className="primary-button" onClick={reset}>
+              Start New Participant Session
+            </button>
+            <button className="ghost-button" onClick={reset}>
+              Back to Main Page
+            </button>
+          </div>
         </section>
       )}
 
@@ -1360,10 +1642,10 @@ function App() {
               </button>
               <button
                 className="secondary-button"
-                onClick={() => void exportFourConfiguredCsvs()}
+                onClick={() => void exportExperimentCsvs()}
                 disabled={adminExporting}
               >
-                {adminExporting ? 'Exporting CSVs...' : 'Export 4 CSVs'}
+                {adminExporting ? 'Exporting CSVs...' : 'Export Experiment CSVs'}
               </button>
               <button className="secondary-button" onClick={refreshAdminData}>
                 Refresh Data
@@ -1388,6 +1670,16 @@ function App() {
               <select
                 value={adminConfig.practiceEnabled ? 'yes' : 'no'}
                 onChange={(event) => updateAdminConfig('practiceEnabled', event.target.value === 'yes')}
+              >
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </label>
+            <label>
+              Allow participant exit
+              <select
+                value={adminConfig.exitAllowed ? 'yes' : 'no'}
+                onChange={(event) => updateAdminConfig('exitAllowed', event.target.value === 'yes')}
               >
                 <option value="yes">Yes</option>
                 <option value="no">No</option>
@@ -1688,6 +1980,32 @@ function App() {
                   <option value="no">No</option>
                 </select>
               </label>
+
+              <label>
+                Show custom in-experiment instruction
+                <select
+                  value={adminConfig.groupConfigs.A.showCustomInstruction ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle(
+                      'A',
+                      'showCustomInstruction',
+                      event.target.value === 'yes'
+                    )
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+
+              <label>
+                Custom instruction text
+                <textarea
+                  rows={3}
+                  value={adminConfig.groupConfigs.A.customInstruction}
+                  onChange={(event) => updateGroupCustomInstruction('A', event.target.value)}
+                />
+              </label>
             </article>
 
             <article className="arm-card">
@@ -1748,6 +2066,32 @@ function App() {
                   <option value="yes">Yes</option>
                   <option value="no">No</option>
                 </select>
+              </label>
+
+              <label>
+                Show custom in-experiment instruction
+                <select
+                  value={adminConfig.groupConfigs.B.showCustomInstruction ? 'yes' : 'no'}
+                  onChange={(event) =>
+                    updateGroupDetailToggle(
+                      'B',
+                      'showCustomInstruction',
+                      event.target.value === 'yes'
+                    )
+                  }
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+
+              <label>
+                Custom instruction text
+                <textarea
+                  rows={3}
+                  value={adminConfig.groupConfigs.B.customInstruction}
+                  onChange={(event) => updateGroupCustomInstruction('B', event.target.value)}
+                />
               </label>
             </article>
           </div>

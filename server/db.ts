@@ -106,6 +106,20 @@ db.exec(`
     created_at TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
   );
+
+  CREATE TABLE IF NOT EXISTS auth_otp_codes (
+    email TEXT PRIMARY KEY,
+    otp TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS auth_login_tokens (
+    token TEXT PRIMARY KEY,
+    participant_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `)
 
 const sessionColumns = db
@@ -167,9 +181,10 @@ if (!memoryRecallColumnNames.has('arm_index')) {
 const defaultExperimentConfig = {
   title: 'Bandit Decision-Making Study',
   purpose:
-    'This study examines how people learn from rewards while making repeated decisions.',
+    'This experiment studies how people learn from feedback under uncertainty and how different information views affect decision quality over repeated rounds.',
   instructions:
-    'In each round, choose one arm. Rewards are either 0 or 1. Try to maximize your total reward.',
+    'Your aim is to maximize total reward by selecting one arm per round. Rewards are binary (0 or 1). Some arms are better than others, so use feedback from earlier rounds to improve your choices.',
+  exitAllowed: true,
   maxFinalExperimentsPerParticipant: 1,
   experiments: [
     {
@@ -188,19 +203,25 @@ const defaultExperimentConfig = {
     rounds: 10,
   },
   abTestingEnabled: true,
-  defaultVisibilityMode: 'last-3',
+  defaultVisibilityMode: 'none',
   groupConfigs: {
     A: {
+      visibilityMode: 'none',
+      showRoundHistory: false,
+      showArmPullCounts: false,
+      showCurrentArmProbabilities: false,
+      showCustomInstruction: true,
+      customInstruction:
+        'Group A condition: minimal feedback view. Focus on learning from immediate outcomes and strategy over time to maximize reward.',
+    },
+    B: {
       visibilityMode: 'full',
       showRoundHistory: true,
       showArmPullCounts: true,
-      showCurrentArmProbabilities: false,
-    },
-    B: {
-      visibilityMode: 'last-3',
-      showRoundHistory: false,
-      showArmPullCounts: true,
-      showCurrentArmProbabilities: false,
+      showCurrentArmProbabilities: true,
+      showCustomInstruction: true,
+      customInstruction:
+        'Group B condition: full feedback view. Use round history, pull counts, and displayed reward probabilities to optimize your selections.',
     },
   },
 }

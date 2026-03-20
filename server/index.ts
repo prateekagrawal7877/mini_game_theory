@@ -1,7 +1,9 @@
+import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
 import db from './db'
 import crypto from 'node:crypto'
+import nodemailer from 'nodemailer'
 
 type VisibilityMode = 'none' | 'last-3' | 'full' | 'summary'
 
@@ -11,9 +13,12 @@ type SessionSettings = {
   numArms: number
   rounds: number
   visibilityMode: VisibilityMode
+  exitAllowed: boolean
   showRoundHistory: boolean
   showArmPullCounts: boolean
   showCurrentArmProbabilities: boolean
+  showGroupInstruction: boolean
+  groupInstruction: string
 }
 
 type ABGroup = 'A' | 'B'
@@ -39,6 +44,7 @@ type ExperimentConfig = {
   title: string
   purpose: string
   instructions: string
+  exitAllowed: boolean
   maxFinalExperimentsPerParticipant: number
   experiments: ExperimentDefinition[]
   practiceEnabled: boolean
@@ -51,12 +57,16 @@ type ExperimentConfig = {
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
     B: {
       visibilityMode: VisibilityMode
       showRoundHistory: boolean
       showArmPullCounts: boolean
       showCurrentArmProbabilities: boolean
+      showCustomInstruction: boolean
+      customInstruction: string
     }
   }
 }
@@ -87,8 +97,94 @@ const port = Number(process.env.PORT ?? 8787)
 const adminPassword = process.env.ADMIN_PASSWORD ?? 'change-me-now'
 const adminTokens = new Map<string, number>()
 
+const TEST_PARTICIPANT_ID = 'prateek@kriti'
+const TEST_OTP = '123456'
+const OTP_TTL_MS = 10 * 60 * 1000
+const LOGIN_TOKEN_TTL_MS = 2 * 60 * 60 * 1000
+
+function createOtpCode(): string {
+  return String(Math.floor(100000 + Math.random() * 900000))
+}
+
+function createLoginToken(participantId: string): string {
+  const token = createId('login')
+  const nowIso = new Date().toISOString()
+  const expiresAt = Date.now() + LOGIN_TOKEN_TTL_MS
+  insertLoginToken.run(token, participantId, expiresAt, nowIso)
+  return token
+}
+
+function isValidLoginToken(token: string, participantId: string): boolean {
+  deleteExpiredLoginTokens.run(Date.now())
+
+  const row = selectLoginTokenByToken.get(token) as
+    | { participant_id: string; expires_at: number }
+    | undefined
+
+  if (!row) {
+    return false
+  }
+
+  if (row.expires_at < Date.now()) {
+    deleteLoginTokenByToken.run(token)
+    return false
+  }
+
+  return row.participant_id === participantId
+}
+
+const otpSenderEmail = process.env.OTP_SENDER_EMAIL ?? ''
+const otpSenderPassword = process.env.OTP_SENDER_PASSWORD ?? ''
+const allowOtpDeliveryFallback =
+  String(process.env.ALLOW_OTP_DELIVERY_FALLBACK ?? (process.env.NODE_ENV !== 'production')) ===
+  'true'
+
+const otpTransporter = nodemailer.createTransport({
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  auth: {
+    user: otpSenderEmail,
+    pass: otpSenderPassword,
+  },
+})
+
+async function sendOtpEmail(recipientEmail: string, otp: string): Promise<void> {
+  await otpTransporter.sendMail({
+    from: otpSenderEmail,
+    to: recipientEmail,
+    subject: 'Your Experiment OTP Code',
+    text: `Your OTP code is ${otp}. It expires in 10 minutes.`,
+  })
+}
+
 app.use(cors())
 app.use(express.json({ limit: '2mb' }))
+
+const upsertOtpCode = db.prepare(
+  `INSERT INTO auth_otp_codes (email, otp, expires_at, created_at)
+   VALUES (?, ?, ?, ?)
+   ON CONFLICT(email) DO UPDATE SET
+     otp = excluded.otp,
+     expires_at = excluded.expires_at,
+     created_at = excluded.created_at`
+)
+
+const selectOtpCodeByEmail = db.prepare(
+  'SELECT otp, expires_at FROM auth_otp_codes WHERE email = ?'
+)
+
+const deleteOtpCodeByEmail = db.prepare('DELETE FROM auth_otp_codes WHERE email = ?')
+const deleteExpiredOtpCodes = db.prepare('DELETE FROM auth_otp_codes WHERE expires_at < ?')
+
+const insertLoginToken = db.prepare(
+  'INSERT INTO auth_login_tokens (token, participant_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
+)
+const selectLoginTokenByToken = db.prepare(
+  'SELECT participant_id, expires_at FROM auth_login_tokens WHERE token = ?'
+)
+const deleteLoginTokenByToken = db.prepare('DELETE FROM auth_login_tokens WHERE token = ?')
+const deleteExpiredLoginTokens = db.prepare('DELETE FROM auth_login_tokens WHERE expires_at < ?')
 
 const insertSession = db.prepare(
   `INSERT INTO sessions (
@@ -286,33 +382,44 @@ function getExperimentConfig(): ExperimentConfig {
     title: String(raw.title ?? 'Bandit Decision-Making Study'),
     purpose: String(
       raw.purpose ??
-        'This study examines how people learn from rewards while making repeated decisions.'
+        'This experiment studies how people learn from feedback under uncertainty and how different information views affect decision quality over repeated rounds.'
     ),
     instructions: String(
       raw.instructions ??
-        'In each round, choose one arm. Rewards are either 0 or 1. Try to maximize your total reward.'
+        'Your aim is to maximize total reward by selecting one arm per round. Rewards are binary (0 or 1). Some arms are better than others, so use feedback from earlier rounds to improve your choices.'
     ),
-      maxFinalExperimentsPerParticipant,
-      experiments: normalizedExperiments.length > 0 ? normalizedExperiments : [fallbackExperiment],
+    exitAllowed: Boolean(raw.exitAllowed ?? true),
+    maxFinalExperimentsPerParticipant,
+    experiments: normalizedExperiments.length > 0 ? normalizedExperiments : [fallbackExperiment],
     practiceEnabled: Boolean(raw.practiceEnabled ?? true),
     practiceConfig: normalizePracticeConfig(raw.practiceConfig),
     abTestingEnabled: Boolean(raw.abTestingEnabled ?? true),
-    defaultVisibilityMode: (raw.defaultVisibilityMode as VisibilityMode) ?? 'last-3',
+    defaultVisibilityMode: (raw.defaultVisibilityMode as VisibilityMode) ?? 'none',
     groupConfigs: {
       A: {
-        visibilityMode: (raw.groupConfigs?.A?.visibilityMode as VisibilityMode) ?? 'full',
-        showRoundHistory: Boolean(raw.groupConfigs?.A?.showRoundHistory ?? true),
-        showArmPullCounts: Boolean(raw.groupConfigs?.A?.showArmPullCounts ?? true),
+        visibilityMode: (raw.groupConfigs?.A?.visibilityMode as VisibilityMode) ?? 'none',
+        showRoundHistory: Boolean(raw.groupConfigs?.A?.showRoundHistory ?? false),
+        showArmPullCounts: Boolean(raw.groupConfigs?.A?.showArmPullCounts ?? false),
         showCurrentArmProbabilities: Boolean(
           raw.groupConfigs?.A?.showCurrentArmProbabilities ?? false
         ),
+        showCustomInstruction: Boolean(raw.groupConfigs?.A?.showCustomInstruction ?? true),
+        customInstruction: String(
+          raw.groupConfigs?.A?.customInstruction ??
+            'Group A condition: minimal feedback view. Focus on learning from immediate outcomes and strategy over time to maximize reward.'
+        ),
       },
       B: {
-        visibilityMode: (raw.groupConfigs?.B?.visibilityMode as VisibilityMode) ?? 'last-3',
-        showRoundHistory: Boolean(raw.groupConfigs?.B?.showRoundHistory ?? false),
+        visibilityMode: (raw.groupConfigs?.B?.visibilityMode as VisibilityMode) ?? 'full',
+        showRoundHistory: Boolean(raw.groupConfigs?.B?.showRoundHistory ?? true),
         showArmPullCounts: Boolean(raw.groupConfigs?.B?.showArmPullCounts ?? true),
         showCurrentArmProbabilities: Boolean(
-          raw.groupConfigs?.B?.showCurrentArmProbabilities ?? false
+          raw.groupConfigs?.B?.showCurrentArmProbabilities ?? true
+        ),
+        showCustomInstruction: Boolean(raw.groupConfigs?.B?.showCustomInstruction ?? true),
+        customInstruction: String(
+          raw.groupConfigs?.B?.customInstruction ??
+            'Group B condition: full feedback view. Use round history, pull counts, and displayed reward probabilities to optimize your selections.'
         ),
       },
     },
@@ -347,23 +454,14 @@ function chooseBalancedGroup(config: ExperimentConfig): ABGroup {
 
   const countA = Number(counts.count_a ?? 0)
   const countB = Number(counts.count_b ?? 0)
-  const diff = countA - countB
 
-  // Keep assignment random, while strongly pulling toward the underrepresented group.
-  // diff > 0 means A has more participants, so bias toward B (and vice versa).
-  if (diff === 0) {
+  // Strict balancing: always place the next participant in the smaller group.
+  // Random tie-break keeps assignment unbiased when counts are equal.
+  if (countA === countB) {
     return secureRandom01() < 0.5 ? 'A' : 'B'
   }
 
-  const underrepresented: ABGroup = diff > 0 ? 'B' : 'A'
-  const absDiff = Math.abs(diff)
-  const underrepresentedProbability = absDiff >= 2 ? 0.95 : 0.75
-
-  return secureRandom01() < underrepresentedProbability
-    ? underrepresented
-    : underrepresented === 'A'
-    ? 'B'
-    : 'A'
+  return countA < countB ? 'A' : 'B'
 }
 
 function getVisibilityMode(config: ExperimentConfig, group: ABGroup): VisibilityMode {
@@ -387,6 +485,9 @@ function validateExperimentConfig(config: ExperimentConfig): string | null {
   }
   if (!config.instructions?.trim()) {
     return 'instructions are required'
+  }
+  if (typeof config.exitAllowed !== 'boolean') {
+    return 'exitAllowed must be boolean'
   }
   if (
     !Number.isInteger(config.maxFinalExperimentsPerParticipant) ||
@@ -481,6 +582,18 @@ function validateExperimentConfig(config: ExperimentConfig): string | null {
   if (typeof config.groupConfigs?.B?.showCurrentArmProbabilities !== 'boolean') {
     return 'groupConfigs.B.showCurrentArmProbabilities must be boolean'
   }
+  if (typeof config.groupConfigs?.A?.showCustomInstruction !== 'boolean') {
+    return 'groupConfigs.A.showCustomInstruction must be boolean'
+  }
+  if (typeof config.groupConfigs?.B?.showCustomInstruction !== 'boolean') {
+    return 'groupConfigs.B.showCustomInstruction must be boolean'
+  }
+  if (typeof config.groupConfigs?.A?.customInstruction !== 'string') {
+    return 'groupConfigs.A.customInstruction must be a string'
+  }
+  if (typeof config.groupConfigs?.B?.customInstruction !== 'string') {
+    return 'groupConfigs.B.customInstruction must be a string'
+  }
   return null
 }
 
@@ -558,11 +671,14 @@ function deleteSessionData(sessionId: string): void {
 }
 
 function normalizeParticipantId(input: unknown): string {
-  return String(input ?? '').trim().toUpperCase()
+  return String(input ?? '').trim().toLowerCase()
 }
 
 function isValidParticipantId(participantId: string): boolean {
-  return /^[A-Z0-9_-]{4,32}$/.test(participantId)
+  if (participantId === TEST_PARTICIPANT_ID) {
+    return true
+  }
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(participantId)
 }
 
 function escapeCsvCell(value: unknown): string {
@@ -760,6 +876,7 @@ app.get('/api/admin/export/experiment/:experimentId', requireAdminToken, (req, r
        FROM sessions s
        INNER JOIN pulls p ON p.session_id = s.id
        WHERE s.experiment_id = ?
+         AND s.run_type = 'final'
        ORDER BY s.created_at ASC, p.round_index ASC`
     )
     .all(experimentId) as ExportPullRow[]
@@ -800,6 +917,8 @@ app.delete('/api/admin/history', requireAdminToken, (_req, res) => {
     db.prepare('DELETE FROM participant_experiments').run()
     db.prepare('DELETE FROM sessions').run()
     db.prepare('DELETE FROM participants').run()
+    db.prepare('DELETE FROM auth_otp_codes').run()
+    db.prepare('DELETE FROM auth_login_tokens').run()
   })
 
   deleteAllTransaction()
@@ -833,23 +952,98 @@ app.get('/api/participant/experiment', (_req, res) => {
   })
 })
 
+app.post('/api/auth/request-otp', async (req, res) => {
+  const participantId = normalizeParticipantId(req.body?.email)
+
+  if (!participantId || !isValidParticipantId(participantId)) {
+    res.status(400).json({ error: 'Enter a valid email address.' })
+    return
+  }
+
+  deleteExpiredOtpCodes.run(Date.now())
+
+  const otp = participantId === TEST_PARTICIPANT_ID ? TEST_OTP : createOtpCode()
+  upsertOtpCode.run(participantId, otp, Date.now() + OTP_TTL_MS, new Date().toISOString())
+
+  try {
+    if (participantId !== TEST_PARTICIPANT_ID) {
+      await sendOtpEmail(participantId, otp)
+    }
+  } catch (error) {
+    console.error('OTP email delivery failed:', error)
+    if (!allowOtpDeliveryFallback) {
+      res.status(500).json({
+        error:
+          'Failed to send OTP email. Configure OTP sender credentials (prefer Gmail app password) and try again.',
+      })
+      return
+    }
+
+    res.json({
+      ok: true,
+      warning: 'Email delivery failed in fallback mode.',
+    })
+    return
+  }
+
+  res.json({ ok: true })
+})
+
+app.post('/api/auth/verify-otp', (req, res) => {
+  const participantId = normalizeParticipantId(req.body?.email)
+  const otp = String(req.body?.otp ?? '').trim()
+
+  if (!participantId || !isValidParticipantId(participantId)) {
+    res.status(400).json({ error: 'Enter a valid email address.' })
+    return
+  }
+
+  deleteExpiredOtpCodes.run(Date.now())
+
+  const pending = selectOtpCodeByEmail.get(participantId) as
+    | { otp: string; expires_at: number }
+    | undefined
+
+  if (!pending || pending.expires_at < Date.now()) {
+    deleteOtpCodeByEmail.run(participantId)
+    res.status(401).json({ error: 'OTP expired or not requested. Please request a new OTP.' })
+    return
+  }
+
+  if (pending.otp !== otp) {
+    res.status(401).json({ error: 'Invalid OTP.' })
+    return
+  }
+
+  deleteOtpCodeByEmail.run(participantId)
+  const loginToken = createLoginToken(participantId)
+
+  res.json({ ok: true, participantId, loginToken })
+})
+
 app.post('/api/sessions/start', (req, res) => {
   const participantId = normalizeParticipantId(req.body?.participantId)
+  const loginToken = String(req.body?.loginToken ?? '').trim()
   const requestedExperimentId = String(req.body?.experimentId ?? '').trim()
   const requestedRunType = String(req.body?.runType ?? 'final')
   const runType: RunType = requestedRunType === 'practice' ? 'practice' : 'final'
 
   if (!participantId) {
     res.status(400).json({
-      error: 'Participant ID is required. Use 4-32 chars: letters, numbers, _ or -.',
+      error: 'Participant email is required.',
     })
     return
   }
 
   if (!isValidParticipantId(participantId)) {
     res.status(400).json({
-      error: 'Invalid Participant ID format. Use 4-32 chars: letters, numbers, _ or -.',
+      error: 'Invalid participant email format.',
     })
+    return
+  }
+
+  if (!isValidLoginToken(loginToken, participantId)) {
+    res.status(401).json({ error: 'Login verification required. Verify OTP before starting.' })
     return
   }
 
@@ -875,7 +1069,7 @@ app.post('/api/sessions/start', (req, res) => {
 
   const abGroup = resolveParticipantGroup(config, participantId)
 
-  if (runType === 'final') {
+  if (runType === 'final' && participantId !== TEST_PARTICIPANT_ID) {
     const enabledExperimentCount = config.experiments.filter((experiment) => experiment.enabled).length
     const effectiveFinalLimit = Math.max(config.maxFinalExperimentsPerParticipant, enabledExperimentCount)
 
@@ -945,9 +1139,12 @@ app.post('/api/sessions/start', (req, res) => {
     numArms,
     rounds,
     visibilityMode,
+    exitAllowed: config.exitAllowed,
     showRoundHistory: config.groupConfigs[abGroup].showRoundHistory,
     showArmPullCounts: config.groupConfigs[abGroup].showArmPullCounts,
     showCurrentArmProbabilities: config.groupConfigs[abGroup].showCurrentArmProbabilities,
+    showGroupInstruction: config.groupConfigs[abGroup].showCustomInstruction,
+    groupInstruction: config.groupConfigs[abGroup].customInstruction,
   }
 
   insertSession.run({
@@ -1086,8 +1283,8 @@ app.post('/api/sessions/:sessionId/abort', (req, res) => {
   const participantId = normalizeParticipantId(req.body?.participantId)
 
   const sessionRow = db
-    .prepare('SELECT id, participant_id FROM sessions WHERE id = ?')
-    .get(sessionId) as { id: string; participant_id: string | null } | undefined
+    .prepare('SELECT id, participant_id, settings_json FROM sessions WHERE id = ?')
+    .get(sessionId) as { id: string; participant_id: string | null; settings_json: string } | undefined
 
   if (!sessionRow) {
     res.status(404).json({ error: 'Session not found.' })
@@ -1105,6 +1302,12 @@ app.post('/api/sessions/:sessionId/abort', (req, res) => {
 
   if (metricsRow) {
     res.status(409).json({ error: 'Completed sessions cannot be aborted.' })
+    return
+  }
+
+  const settings = parseSessionSettings({ settings_json: sessionRow.settings_json })
+  if (!settings.exitAllowed) {
+    res.status(403).json({ error: 'Exit is disabled for this experiment.' })
     return
   }
 

@@ -25,10 +25,13 @@ This project is a complete experiment workflow for a multi-armed bandit game:
 npm install
 ```
 
-2. Set your admin password (required for admin dashboard):
+2. Create a local environment file at .env with required credentials:
 
 ```bash
-export ADMIN_PASSWORD="your-very-strong-password"
+ADMIN_PASSWORD="your-very-strong-password"
+OTP_SENDER_EMAIL="your-gmail-address@gmail.com"
+OTP_SENDER_PASSWORD="your-gmail-app-password"
+ALLOW_OTP_DELIVERY_FALLBACK="false"
 ```
 
 3. Start frontend + backend together:
