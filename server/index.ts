@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
-import db from './db.js'
+import { ensureDbInitialized, query, withTransaction } from './db.js'
 import crypto from 'node:crypto'
 import nodemailer from 'nodemailer'
 
@@ -96,6 +96,8 @@ const app = express()
 const port = Number(process.env.PORT ?? 8787)
 const adminPassword = process.env.ADMIN_PASSWORD ?? 'change-me-now'
 const ADMIN_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
+const isProduction = process.env.NODE_ENV === 'production'
+const enableTestAccount = String(process.env.ENABLE_TEST_ACCOUNT ?? (!isProduction)) === 'true'
 
 const TEST_PARTICIPANT_ID = 'prateek@kriti'
 const TEST_OTP = '123456'
@@ -106,27 +108,33 @@ function createOtpCode(): string {
   return String(Math.floor(100000 + Math.random() * 900000))
 }
 
-function createLoginToken(participantId: string): string {
+async function createLoginToken(participantId: string): Promise<string> {
   const token = createId('login')
   const nowIso = new Date().toISOString()
   const expiresAt = Date.now() + LOGIN_TOKEN_TTL_MS
-  insertLoginToken.run(token, participantId, expiresAt, nowIso)
+  await query(
+    'INSERT INTO auth_login_tokens (token, participant_id, expires_at, created_at) VALUES ($1, $2, $3, $4)',
+    [token, participantId, expiresAt, nowIso]
+  )
   return token
 }
 
-function isValidLoginToken(token: string, participantId: string): boolean {
-  deleteExpiredLoginTokens.run(Date.now())
+async function isValidLoginToken(token: string, participantId: string): Promise<boolean> {
+  await query('DELETE FROM auth_login_tokens WHERE expires_at < $1', [Date.now()])
 
-  const row = selectLoginTokenByToken.get(token) as
-    | { participant_id: string; expires_at: number }
-    | undefined
+  const result = await query<{ participant_id: string; expires_at: string | number }>(
+    'SELECT participant_id, expires_at FROM auth_login_tokens WHERE token = $1',
+    [token]
+  )
+  const row = result.rows[0]
 
   if (!row) {
     return false
   }
 
-  if (row.expires_at < Date.now()) {
-    deleteLoginTokenByToken.run(token)
+  const expiresAt = Number(row.expires_at)
+  if (expiresAt < Date.now()) {
+    await query('DELETE FROM auth_login_tokens WHERE token = $1', [token])
     return false
   }
 
@@ -138,6 +146,25 @@ const otpSenderPassword = process.env.OTP_SENDER_PASSWORD ?? ''
 const allowOtpDeliveryFallback =
   String(process.env.ALLOW_OTP_DELIVERY_FALLBACK ?? (process.env.NODE_ENV !== 'production')) ===
   'true'
+
+const missingProductionEnv: string[] = []
+if (isProduction) {
+  if (!adminPassword || adminPassword === 'change-me-now') {
+    missingProductionEnv.push('ADMIN_PASSWORD')
+  }
+  if (!otpSenderEmail) {
+    missingProductionEnv.push('OTP_SENDER_EMAIL')
+  }
+  if (!otpSenderPassword) {
+    missingProductionEnv.push('OTP_SENDER_PASSWORD')
+  }
+}
+
+if (missingProductionEnv.length > 0) {
+  throw new Error(
+    `Missing production environment variables: ${missingProductionEnv.join(', ')}.`
+  )
+}
 
 const otpTransporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
@@ -161,120 +188,14 @@ async function sendOtpEmail(recipientEmail: string, otp: string): Promise<void> 
 app.use(cors())
 app.use(express.json({ limit: '2mb' }))
 
-const upsertOtpCode = db.prepare(
-  `INSERT INTO auth_otp_codes (email, otp, expires_at, created_at)
-   VALUES (?, ?, ?, ?)
-   ON CONFLICT(email) DO UPDATE SET
-     otp = excluded.otp,
-     expires_at = excluded.expires_at,
-     created_at = excluded.created_at`
-)
-
-const selectOtpCodeByEmail = db.prepare(
-  'SELECT otp, expires_at FROM auth_otp_codes WHERE email = ?'
-)
-
-const deleteOtpCodeByEmail = db.prepare('DELETE FROM auth_otp_codes WHERE email = ?')
-const deleteExpiredOtpCodes = db.prepare('DELETE FROM auth_otp_codes WHERE expires_at < ?')
-
-const insertLoginToken = db.prepare(
-  'INSERT INTO auth_login_tokens (token, participant_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
-)
-const selectLoginTokenByToken = db.prepare(
-  'SELECT participant_id, expires_at FROM auth_login_tokens WHERE token = ?'
-)
-const deleteLoginTokenByToken = db.prepare('DELETE FROM auth_login_tokens WHERE token = ?')
-const deleteExpiredLoginTokens = db.prepare('DELETE FROM auth_login_tokens WHERE expires_at < ?')
-
-const insertAdminAuthToken = db.prepare(
-  'INSERT INTO admin_auth_tokens (token, expires_at, created_at) VALUES (?, ?, ?)'
-)
-const selectAdminAuthTokenByToken = db.prepare(
-  'SELECT token, expires_at FROM admin_auth_tokens WHERE token = ?'
-)
-const deleteAdminAuthTokenByToken = db.prepare('DELETE FROM admin_auth_tokens WHERE token = ?')
-const deleteExpiredAdminAuthTokens = db.prepare('DELETE FROM admin_auth_tokens WHERE expires_at < ?')
-
-const insertSession = db.prepare(
-  `INSERT INTO sessions (
-      id,
-      created_at,
-      participant_id,
-      experiment_id,
-      run_type,
-      ab_group,
-      settings_json,
-      bandit_means_json
-    ) VALUES (
-      @id,
-      @created_at,
-      @participant_id,
-      @experiment_id,
-      @run_type,
-      @ab_group,
-      @settings_json,
-      @bandit_means_json
-    )`
-)
-
-const insertPull = db.prepare(
-  `INSERT INTO pulls (session_id, round_index, arm_index, reward, created_at)
-   VALUES (@session_id, @round_index, @arm_index, @reward, @created_at)`
-)
-
-const insertMetrics = db.prepare(
-  `INSERT INTO metrics (
-      session_id,
-      total_reward,
-      average_reward,
-      best_arm_index,
-      best_arm_mean,
-      expected_regret,
-      recency_weighted_accuracy,
-      perceived_average_error,
-      metrics_json,
-      created_at
-    ) VALUES (
-      @session_id,
-      @total_reward,
-      @average_reward,
-      @best_arm_index,
-      @best_arm_mean,
-      @expected_regret,
-      @recency_weighted_accuracy,
-      @perceived_average_error,
-      @metrics_json,
-      @created_at
-    )`
-)
-
-const upsertSessionHistory = db.prepare(
-  `INSERT INTO session_history (session_id, participant_id, snapshot_json, created_at)
-   VALUES (@session_id, @participant_id, @snapshot_json, @created_at)
-   ON CONFLICT(session_id) DO UPDATE SET
-     participant_id = excluded.participant_id,
-     snapshot_json = excluded.snapshot_json,
-     created_at = excluded.created_at`
-)
-
-const upsertParticipantExperiment = db.prepare(
-  `INSERT INTO participant_experiments (
-      participant_id,
-      experiment_id,
-      final_completed_at,
-      final_session_id,
-      created_at
-    ) VALUES (
-      @participant_id,
-      @experiment_id,
-      @final_completed_at,
-      @final_session_id,
-      @created_at
-    )
-    ON CONFLICT(participant_id, experiment_id) DO UPDATE SET
-      final_completed_at = excluded.final_completed_at,
-      final_session_id = excluded.final_session_id`
-)
+app.use(async (_req, res, next) => {
+  try {
+    await ensureDbInitialized()
+    next()
+  } catch (error) {
+    next(error)
+  }
+})
 
 function createId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
@@ -359,10 +280,11 @@ function normalizePracticeConfig(raw: unknown): PracticeConfig {
   }
 }
 
-function getExperimentConfig(): ExperimentConfig {
-  const row = db
-    .prepare('SELECT config_json FROM experiment_config WHERE id = 1')
-    .get() as { config_json: string } | undefined
+async function getExperimentConfig(): Promise<ExperimentConfig> {
+  const result = await query<{ config_json: string }>(
+    'SELECT config_json FROM experiment_config WHERE id = 1'
+  )
+  const row = result.rows[0]
 
   if (!row) {
     throw new Error('Experiment config missing')
@@ -435,11 +357,11 @@ function getExperimentConfig(): ExperimentConfig {
   }
 }
 
-function saveExperimentConfig(config: ExperimentConfig): void {
-  db.prepare('UPDATE experiment_config SET config_json = ?, updated_at = ? WHERE id = 1').run(
+async function saveExperimentConfig(config: ExperimentConfig): Promise<void> {
+  await query('UPDATE experiment_config SET config_json = $1, updated_at = $2 WHERE id = 1', [
     JSON.stringify(config),
-    new Date().toISOString()
-  )
+    new Date().toISOString(),
+  ])
 }
 
 function secureRandom01(): number {
@@ -447,19 +369,18 @@ function secureRandom01(): number {
   return value / 0x100000000
 }
 
-function chooseBalancedGroup(config: ExperimentConfig): ABGroup {
+async function chooseBalancedGroup(config: ExperimentConfig): Promise<ABGroup> {
   if (!config.abTestingEnabled) {
     return 'A'
   }
 
-  const counts = db
-    .prepare(
-      `SELECT
-         SUM(CASE WHEN ab_group = 'A' THEN 1 ELSE 0 END) AS count_a,
-         SUM(CASE WHEN ab_group = 'B' THEN 1 ELSE 0 END) AS count_b
-       FROM participants`
-    )
-    .get() as { count_a: number | null; count_b: number | null }
+  const result = await query<{ count_a: string | number | null; count_b: string | number | null }>(
+    `SELECT
+       SUM(CASE WHEN ab_group = 'A' THEN 1 ELSE 0 END) AS count_a,
+       SUM(CASE WHEN ab_group = 'B' THEN 1 ELSE 0 END) AS count_b
+     FROM participants`
+  )
+  const counts = result.rows[0] ?? { count_a: 0, count_b: 0 }
 
   const countA = Number(counts.count_a ?? 0)
   const countB = Number(counts.count_b ?? 0)
@@ -606,7 +527,11 @@ function validateExperimentConfig(config: ExperimentConfig): string | null {
   return null
 }
 
-function requireAdminToken(req: express.Request, res: express.Response, next: express.NextFunction): void {
+async function requireAdminToken(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): Promise<void> {
   const token = String(req.header('x-admin-token') ?? '')
 
   if (!token) {
@@ -614,14 +539,16 @@ function requireAdminToken(req: express.Request, res: express.Response, next: ex
     return
   }
 
-  deleteExpiredAdminAuthTokens.run(Date.now())
-  const row = selectAdminAuthTokenByToken.get(token) as
-    | { token: string; expires_at: number }
-    | undefined
+  await query('DELETE FROM admin_auth_tokens WHERE expires_at < $1', [Date.now()])
+  const result = await query<{ token: string; expires_at: string | number }>(
+    'SELECT token, expires_at FROM admin_auth_tokens WHERE token = $1',
+    [token]
+  )
+  const row = result.rows[0]
 
-  if (!row || row.expires_at < Date.now()) {
+  if (!row || Number(row.expires_at) < Date.now()) {
     if (row) {
-      deleteAdminAuthTokenByToken.run(token)
+      await query('DELETE FROM admin_auth_tokens WHERE token = $1', [token])
     }
     res.status(401).json({ error: 'Unauthorized admin access.' })
     return
@@ -645,16 +572,22 @@ function pickExperiment(config: ExperimentConfig, experimentId: string): Experim
   return selected ?? enabledExperiments[0]
 }
 
-function resolveParticipantGroup(config: ExperimentConfig, participantId: string): ABGroup {
-  const row = db
-    .prepare('SELECT participant_id, ab_group FROM participants WHERE participant_id = ?')
-    .get(participantId) as { participant_id: string; ab_group: string | null } | undefined
+async function resolveParticipantGroup(
+  config: ExperimentConfig,
+  participantId: string
+): Promise<ABGroup> {
+  const rowResult = await query<{ participant_id: string; ab_group: string | null }>(
+    'SELECT participant_id, ab_group FROM participants WHERE participant_id = $1',
+    [participantId]
+  )
+  const row = rowResult.rows[0]
 
   if (!row) {
-    const group = chooseBalancedGroup(config)
-    db.prepare(
-      'INSERT INTO participants (participant_id, created_at, ab_group, final_completed_at) VALUES (?, ?, ?, NULL)'
-    ).run(participantId, new Date().toISOString(), group)
+    const group = await chooseBalancedGroup(config)
+    await query(
+      'INSERT INTO participants (participant_id, created_at, ab_group, final_completed_at) VALUES ($1, $2, $3, NULL)',
+      [participantId, new Date().toISOString(), group]
+    )
     return group
   }
 
@@ -662,34 +595,38 @@ function resolveParticipantGroup(config: ExperimentConfig, participantId: string
     return row.ab_group
   }
 
-  const group = chooseBalancedGroup(config)
-  db.prepare('UPDATE participants SET ab_group = ? WHERE participant_id = ?').run(group, participantId)
+  const group = await chooseBalancedGroup(config)
+  await query('UPDATE participants SET ab_group = $1 WHERE participant_id = $2', [
+    group,
+    participantId,
+  ])
   return group
 }
 
-function deleteSessionData(sessionId: string): void {
-  const deleteTransaction = db.transaction(() => {
-    const sessionMeta = db
-      .prepare('SELECT participant_id, experiment_id, run_type FROM sessions WHERE id = ?')
-      .get(sessionId) as
-      | { participant_id: string | null; experiment_id: string | null; run_type: RunType }
-      | undefined
+async function deleteSessionData(sessionId: string): Promise<void> {
+  await withTransaction(async (client) => {
+    const sessionMetaResult = await query<{
+      participant_id: string | null
+      experiment_id: string | null
+      run_type: RunType
+    }>('SELECT participant_id, experiment_id, run_type FROM sessions WHERE id = $1', [sessionId], client)
+    const sessionMeta = sessionMetaResult.rows[0]
 
     if (sessionMeta?.run_type === 'final' && sessionMeta.participant_id && sessionMeta.experiment_id) {
-      db.prepare(
-        'DELETE FROM participant_experiments WHERE participant_id = ? AND experiment_id = ? AND final_session_id = ?'
-      ).run(sessionMeta.participant_id, sessionMeta.experiment_id, sessionId)
+      await query(
+        'DELETE FROM participant_experiments WHERE participant_id = $1 AND experiment_id = $2 AND final_session_id = $3',
+        [sessionMeta.participant_id, sessionMeta.experiment_id, sessionId],
+        client
+      )
     }
 
-    db.prepare('DELETE FROM pulls WHERE session_id = ?').run(sessionId)
-    db.prepare('DELETE FROM questionnaires WHERE session_id = ?').run(sessionId)
-    db.prepare('DELETE FROM memory_recall_items WHERE session_id = ?').run(sessionId)
-    db.prepare('DELETE FROM metrics WHERE session_id = ?').run(sessionId)
-    db.prepare('DELETE FROM session_history WHERE session_id = ?').run(sessionId)
-    db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId)
+    await query('DELETE FROM pulls WHERE session_id = $1', [sessionId], client)
+    await query('DELETE FROM questionnaires WHERE session_id = $1', [sessionId], client)
+    await query('DELETE FROM memory_recall_items WHERE session_id = $1', [sessionId], client)
+    await query('DELETE FROM metrics WHERE session_id = $1', [sessionId], client)
+    await query('DELETE FROM session_history WHERE session_id = $1', [sessionId], client)
+    await query('DELETE FROM sessions WHERE id = $1', [sessionId], client)
   })
-
-  deleteTransaction()
 }
 
 function normalizeParticipantId(input: unknown): string {
@@ -697,7 +634,7 @@ function normalizeParticipantId(input: unknown): string {
 }
 
 function isValidParticipantId(participantId: string): boolean {
-  if (participantId === TEST_PARTICIPANT_ID) {
+  if (enableTestAccount && participantId === TEST_PARTICIPANT_ID) {
     return true
   }
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(participantId)
@@ -785,7 +722,7 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
 })
 
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const providedPassword = String(req.body?.password ?? '')
 
   if (!providedPassword || providedPassword !== adminPassword) {
@@ -794,18 +731,22 @@ app.post('/api/admin/login', (req, res) => {
   }
 
   const token = crypto.randomBytes(24).toString('hex')
-  deleteExpiredAdminAuthTokens.run(Date.now())
-  insertAdminAuthToken.run(token, Date.now() + ADMIN_TOKEN_TTL_MS, new Date().toISOString())
+  await query('DELETE FROM admin_auth_tokens WHERE expires_at < $1', [Date.now()])
+  await query('INSERT INTO admin_auth_tokens (token, expires_at, created_at) VALUES ($1, $2, $3)', [
+    token,
+    Date.now() + ADMIN_TOKEN_TTL_MS,
+    new Date().toISOString(),
+  ])
 
   res.json({ token })
 })
 
-app.get('/api/admin/experiment', requireAdminToken, (_req, res) => {
-  const config = getExperimentConfig()
+app.get('/api/admin/experiment', requireAdminToken, async (_req, res) => {
+  const config = await getExperimentConfig()
   res.json({ config })
 })
 
-app.put('/api/admin/experiment', requireAdminToken, (req, res) => {
+app.put('/api/admin/experiment', requireAdminToken, async (req, res) => {
   const proposedConfig = req.body?.config as ExperimentConfig
   const validationError = validateExperimentConfig(proposedConfig)
 
@@ -814,97 +755,93 @@ app.put('/api/admin/experiment', requireAdminToken, (req, res) => {
     return
   }
 
-  saveExperimentConfig(proposedConfig)
+  await saveExperimentConfig(proposedConfig)
   res.json({ ok: true, config: proposedConfig })
 })
 
-app.get('/api/admin/sessions', requireAdminToken, (_req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT
-         s.id,
-         s.created_at,
-         s.participant_id,
-         s.experiment_id,
-         s.run_type,
-         s.ab_group,
-         m.total_reward,
-         m.average_reward,
-         m.expected_regret,
-         m.recency_weighted_accuracy,
-         m.perceived_average_error
-       FROM sessions s
-       LEFT JOIN metrics m ON m.session_id = s.id
-       ORDER BY s.created_at DESC
-       LIMIT 200`
-    )
-    .all() as Array<Record<string, unknown>>
+app.get('/api/admin/sessions', requireAdminToken, async (_req, res) => {
+  const rowsResult = await query<Record<string, unknown>>(
+    `SELECT
+       s.id,
+       s.created_at,
+       s.participant_id,
+       s.experiment_id,
+       s.run_type,
+       s.ab_group,
+       m.total_reward,
+       m.average_reward,
+       m.expected_regret,
+       m.recency_weighted_accuracy,
+       m.perceived_average_error
+     FROM sessions s
+     LEFT JOIN metrics m ON m.session_id = s.id
+     ORDER BY s.created_at DESC
+     LIMIT 200`
+  )
 
-  res.json({ rows })
+  res.json({ rows: rowsResult.rows })
 })
 
-app.get('/api/admin/export/group/:group', requireAdminToken, (req, res) => {
+app.get('/api/admin/export/group/:group', requireAdminToken, async (req, res) => {
   const group = String(req.params.group).toUpperCase()
   if (group !== 'A' && group !== 'B') {
     res.status(400).json({ error: 'group must be A or B' })
     return
   }
 
-  const rows = db
-    .prepare(
-      `SELECT
-         s.id AS session_id,
-         s.created_at AS session_created_at,
-         s.participant_id,
-         s.run_type,
-         s.ab_group,
-         s.experiment_id,
-         s.settings_json,
-         s.bandit_means_json,
-         p.round_index,
-         p.arm_index,
-         p.reward,
-         p.created_at AS pull_created_at
-       FROM sessions s
-       INNER JOIN pulls p ON p.session_id = s.id
-       WHERE s.ab_group = ?
-       ORDER BY s.created_at ASC, p.round_index ASC`
-    )
-    .all(group) as ExportPullRow[]
+  const rowsResult = await query<ExportPullRow>(
+    `SELECT
+       s.id AS session_id,
+       s.created_at AS session_created_at,
+       s.participant_id,
+       s.run_type,
+       s.ab_group,
+       s.experiment_id,
+       s.settings_json,
+       s.bandit_means_json,
+       p.round_index,
+       p.arm_index,
+       p.reward,
+       p.created_at AS pull_created_at
+     FROM sessions s
+     INNER JOIN pulls p ON p.session_id = s.id
+     WHERE s.ab_group = $1
+     ORDER BY s.created_at ASC, p.round_index ASC`,
+    [group]
+  )
 
-  const csv = buildPullHistoryCsv(rows)
+  const csv = buildPullHistoryCsv(rowsResult.rows)
   res.setHeader('Content-Type', 'text/csv; charset=utf-8')
   res.setHeader('Content-Disposition', `attachment; filename="group_${group}_pull_history.csv"`)
   res.send(csv)
 })
 
-app.get('/api/admin/export/experiment/:experimentId', requireAdminToken, (req, res) => {
+app.get('/api/admin/export/experiment/:experimentId', requireAdminToken, async (req, res) => {
   const experimentId = String(req.params.experimentId)
 
-  const rows = db
-    .prepare(
-      `SELECT
-         s.id AS session_id,
-         s.created_at AS session_created_at,
-         s.participant_id,
-         s.run_type,
-         s.ab_group,
-         s.experiment_id,
-         s.settings_json,
-         s.bandit_means_json,
-         p.round_index,
-         p.arm_index,
-         p.reward,
-         p.created_at AS pull_created_at
-       FROM sessions s
-       INNER JOIN pulls p ON p.session_id = s.id
-       WHERE s.experiment_id = ?
-         AND s.run_type = 'final'
-       ORDER BY s.created_at ASC, p.round_index ASC`
-    )
-    .all(experimentId) as ExportPullRow[]
+  const rowsResult = await query<ExportPullRow>(
+    `SELECT
+       s.id AS session_id,
+       s.created_at AS session_created_at,
+       s.participant_id,
+       s.run_type,
+       s.ab_group,
+       s.experiment_id,
+       s.settings_json,
+       s.bandit_means_json,
+       p.round_index,
+       p.arm_index,
+       p.reward,
+       p.created_at AS pull_created_at
+     FROM sessions s
+     INNER JOIN pulls p ON p.session_id = s.id
+     WHERE s.experiment_id = $1
+       AND s.run_type = 'final'
+     ORDER BY s.created_at ASC, p.round_index ASC`,
+    [experimentId]
+  )
 
-  const csv = buildPullHistoryCsv(rows)
+  const csv = buildPullHistoryCsv(rowsResult.rows)
   const safeExperimentId = experimentId.replace(/[^a-zA-Z0-9_-]/g, '_')
   res.setHeader('Content-Type', 'text/csv; charset=utf-8')
   res.setHeader(
@@ -914,43 +851,42 @@ app.get('/api/admin/export/experiment/:experimentId', requireAdminToken, (req, r
   res.send(csv)
 })
 
-app.delete('/api/admin/history/:sessionId', requireAdminToken, (req, res) => {
+app.delete('/api/admin/history/:sessionId', requireAdminToken, async (req, res) => {
   const sessionId = String(req.params.sessionId)
-  const exists = db.prepare('SELECT id FROM sessions WHERE id = ?').get(sessionId) as
-    | { id: string }
-    | undefined
+  const existsResult = await query<{ id: string }>('SELECT id FROM sessions WHERE id = $1', [
+    sessionId,
+  ])
+  const exists = existsResult.rows[0]
 
   if (!exists) {
     res.status(404).json({ error: 'Session not found.' })
     return
   }
 
-  deleteSessionData(sessionId)
+  await deleteSessionData(sessionId)
 
   res.json({ ok: true, deletedSessionId: sessionId })
 })
 
-app.delete('/api/admin/history', requireAdminToken, (_req, res) => {
-  const deleteAllTransaction = db.transaction(() => {
-    db.prepare('DELETE FROM pulls').run()
-    db.prepare('DELETE FROM questionnaires').run()
-    db.prepare('DELETE FROM memory_recall_items').run()
-    db.prepare('DELETE FROM metrics').run()
-    db.prepare('DELETE FROM session_history').run()
-    db.prepare('DELETE FROM participant_experiments').run()
-    db.prepare('DELETE FROM sessions').run()
-    db.prepare('DELETE FROM participants').run()
-    db.prepare('DELETE FROM auth_otp_codes').run()
-    db.prepare('DELETE FROM auth_login_tokens').run()
+app.delete('/api/admin/history', requireAdminToken, async (_req, res) => {
+  await withTransaction(async (client) => {
+    await query('DELETE FROM pulls', [], client)
+    await query('DELETE FROM questionnaires', [], client)
+    await query('DELETE FROM memory_recall_items', [], client)
+    await query('DELETE FROM metrics', [], client)
+    await query('DELETE FROM session_history', [], client)
+    await query('DELETE FROM participant_experiments', [], client)
+    await query('DELETE FROM sessions', [], client)
+    await query('DELETE FROM participants', [], client)
+    await query('DELETE FROM auth_otp_codes', [], client)
+    await query('DELETE FROM auth_login_tokens', [], client)
   })
-
-  deleteAllTransaction()
 
   res.json({ ok: true })
 })
 
-app.get('/api/participant/experiment', (_req, res) => {
-  const config = getExperimentConfig()
+app.get('/api/participant/experiment', async (_req, res) => {
+  const config = await getExperimentConfig()
 
   res.json({
     title: config.title,
@@ -977,19 +913,28 @@ app.get('/api/participant/experiment', (_req, res) => {
 
 app.post('/api/auth/request-otp', async (req, res) => {
   const participantId = normalizeParticipantId(req.body?.email)
+  const isTester = enableTestAccount && participantId === TEST_PARTICIPANT_ID
 
   if (!participantId || !isValidParticipantId(participantId)) {
     res.status(400).json({ error: 'Enter a valid email address.' })
     return
   }
 
-  deleteExpiredOtpCodes.run(Date.now())
+  await query('DELETE FROM auth_otp_codes WHERE expires_at < $1', [Date.now()])
 
-  const otp = participantId === TEST_PARTICIPANT_ID ? TEST_OTP : createOtpCode()
-  upsertOtpCode.run(participantId, otp, Date.now() + OTP_TTL_MS, new Date().toISOString())
+  const otp = isTester ? TEST_OTP : createOtpCode()
+  await query(
+    `INSERT INTO auth_otp_codes (email, otp, expires_at, created_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT(email) DO UPDATE SET
+       otp = excluded.otp,
+       expires_at = excluded.expires_at,
+       created_at = excluded.created_at`,
+    [participantId, otp, Date.now() + OTP_TTL_MS, new Date().toISOString()]
+  )
 
   try {
-    if (participantId !== TEST_PARTICIPANT_ID) {
+    if (!isTester) {
       await sendOtpEmail(participantId, otp)
     }
   } catch (error) {
@@ -1012,7 +957,7 @@ app.post('/api/auth/request-otp', async (req, res) => {
   res.json({ ok: true })
 })
 
-app.post('/api/auth/verify-otp', (req, res) => {
+app.post('/api/auth/verify-otp', async (req, res) => {
   const participantId = normalizeParticipantId(req.body?.email)
   const otp = String(req.body?.otp ?? '').trim()
 
@@ -1021,14 +966,16 @@ app.post('/api/auth/verify-otp', (req, res) => {
     return
   }
 
-  deleteExpiredOtpCodes.run(Date.now())
+  await query('DELETE FROM auth_otp_codes WHERE expires_at < $1', [Date.now()])
 
-  const pending = selectOtpCodeByEmail.get(participantId) as
-    | { otp: string; expires_at: number }
-    | undefined
+  const pendingResult = await query<{ otp: string; expires_at: string | number }>(
+    'SELECT otp, expires_at FROM auth_otp_codes WHERE email = $1',
+    [participantId]
+  )
+  const pending = pendingResult.rows[0]
 
-  if (!pending || pending.expires_at < Date.now()) {
-    deleteOtpCodeByEmail.run(participantId)
+  if (!pending || Number(pending.expires_at) < Date.now()) {
+    await query('DELETE FROM auth_otp_codes WHERE email = $1', [participantId])
     res.status(401).json({ error: 'OTP expired or not requested. Please request a new OTP.' })
     return
   }
@@ -1038,13 +985,13 @@ app.post('/api/auth/verify-otp', (req, res) => {
     return
   }
 
-  deleteOtpCodeByEmail.run(participantId)
-  const loginToken = createLoginToken(participantId)
+  await query('DELETE FROM auth_otp_codes WHERE email = $1', [participantId])
+  const loginToken = await createLoginToken(participantId)
 
   res.json({ ok: true, participantId, loginToken })
 })
 
-app.post('/api/sessions/start', (req, res) => {
+app.post('/api/sessions/start', async (req, res) => {
   const participantId = normalizeParticipantId(req.body?.participantId)
   const loginToken = String(req.body?.loginToken ?? '').trim()
   const requestedExperimentId = String(req.body?.experimentId ?? '').trim()
@@ -1065,12 +1012,12 @@ app.post('/api/sessions/start', (req, res) => {
     return
   }
 
-  if (!isValidLoginToken(loginToken, participantId)) {
+  if (!(await isValidLoginToken(loginToken, participantId))) {
     res.status(401).json({ error: 'Login verification required. Verify OTP before starting.' })
     return
   }
 
-  const config = getExperimentConfig()
+  const config = await getExperimentConfig()
 
   const selectedExperiment =
     runType === 'practice' ? null : pickExperiment(config, requestedExperimentId)
@@ -1090,19 +1037,21 @@ app.post('/api/sessions/start', (req, res) => {
     return
   }
 
-  const abGroup = resolveParticipantGroup(config, participantId)
+  const abGroup = await resolveParticipantGroup(config, participantId)
 
-  if (runType === 'final' && participantId !== TEST_PARTICIPANT_ID) {
+  const isTester = enableTestAccount && participantId === TEST_PARTICIPANT_ID
+
+  if (runType === 'final' && !isTester) {
     const enabledExperimentCount = config.experiments.filter((experiment) => experiment.enabled).length
     const effectiveFinalLimit = Math.max(config.maxFinalExperimentsPerParticipant, enabledExperimentCount)
 
-    const completedFinalCountRow = db
-      .prepare(
-        'SELECT COUNT(*) AS completed_count FROM participant_experiments WHERE participant_id = ? AND final_completed_at IS NOT NULL'
-      )
-      .get(participantId) as { completed_count: number }
+    const completedFinalCountResult = await query<{ completed_count: string | number }>(
+      'SELECT COUNT(*) AS completed_count FROM participant_experiments WHERE participant_id = $1 AND final_completed_at IS NOT NULL',
+      [participantId]
+    )
+    const completedFinalCountRow = completedFinalCountResult.rows[0] ?? { completed_count: 0 }
 
-    if (completedFinalCountRow.completed_count >= effectiveFinalLimit) {
+    if (Number(completedFinalCountRow.completed_count) >= effectiveFinalLimit) {
       res.status(409).json({
         error:
           'This participant has reached the maximum allowed number of completed final experiments.',
@@ -1110,11 +1059,11 @@ app.post('/api/sessions/start', (req, res) => {
       return
     }
 
-    const existingFinalForExperiment = db
-      .prepare(
-        'SELECT final_completed_at FROM participant_experiments WHERE participant_id = ? AND experiment_id = ?'
-      )
-      .get(participantId, selectedExperiment?.id) as { final_completed_at: string | null } | undefined
+    const existingFinalResult = await query<{ final_completed_at: string | null }>(
+      'SELECT final_completed_at FROM participant_experiments WHERE participant_id = $1 AND experiment_id = $2',
+      [participantId, selectedExperiment?.id ?? null]
+    )
+    const existingFinalForExperiment = existingFinalResult.rows[0]
 
     if (existingFinalForExperiment?.final_completed_at) {
       res.status(409).json({
@@ -1170,16 +1119,28 @@ app.post('/api/sessions/start', (req, res) => {
     groupInstruction: config.groupConfigs[abGroup].customInstruction,
   }
 
-  insertSession.run({
-    id,
-    created_at: createdAt,
-    participant_id: participantId,
-    experiment_id: runType === 'practice' ? 'practice' : selectedExperiment?.id ?? null,
-    run_type: runType,
-    ab_group: abGroup,
-    settings_json: JSON.stringify(settings),
-    bandit_means_json: JSON.stringify(banditMeans),
-  })
+  await query(
+    `INSERT INTO sessions (
+      id,
+      created_at,
+      participant_id,
+      experiment_id,
+      run_type,
+      ab_group,
+      settings_json,
+      bandit_means_json
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      id,
+      createdAt,
+      participantId,
+      runType === 'practice' ? 'practice' : selectedExperiment?.id ?? null,
+      runType,
+      abGroup,
+      JSON.stringify(settings),
+      JSON.stringify(banditMeans),
+    ]
+  )
 
   res.json({
     sessionId: id,
@@ -1194,7 +1155,7 @@ app.post('/api/sessions/start', (req, res) => {
   })
 })
 
-app.post('/api/sessions/:sessionId/complete', (req, res) => {
+app.post('/api/sessions/:sessionId/complete', async (req, res) => {
   const sessionId = String(req.params.sessionId)
   const payload = req.body as CompletionPayload
 
@@ -1206,20 +1167,23 @@ app.post('/api/sessions/:sessionId/complete', (req, res) => {
     return
   }
 
-  const sessionRow = db
-    .prepare('SELECT id FROM sessions WHERE id = ?')
-    .get(sessionId) as { id: string } | undefined
+  const sessionRowResult = await query<{ id: string }>('SELECT id FROM sessions WHERE id = $1', [
+    sessionId,
+  ])
+  const sessionRow = sessionRowResult.rows[0]
 
   if (!sessionRow) {
     res.status(404).json({ error: 'Session not found.' })
     return
   }
 
-  const settingsRow = db
-    .prepare('SELECT settings_json, run_type, participant_id, experiment_id FROM sessions WHERE id = ?')
-    .get(sessionId) as
-    | { settings_json: string; run_type: RunType; participant_id: string | null; experiment_id: string | null }
-    | undefined
+  const settingsResult = await query<{
+    settings_json: string
+    run_type: RunType
+    participant_id: string | null
+    experiment_id: string | null
+  }>('SELECT settings_json, run_type, participant_id, experiment_id FROM sessions WHERE id = $1', [sessionId])
+  const settingsRow = settingsResult.rows[0]
 
   if (!settingsRow) {
     res.status(404).json({ error: 'Session not found.' })
@@ -1240,74 +1204,107 @@ app.post('/api/sessions/:sessionId/complete', (req, res) => {
 
   const now = new Date().toISOString()
 
-  const saveTransaction = db.transaction(() => {
-    const deleteExisting = db.prepare('DELETE FROM pulls WHERE session_id = ?')
-    deleteExisting.run(sessionId)
+  await withTransaction(async (client) => {
+    await query('DELETE FROM pulls WHERE session_id = $1', [sessionId], client)
 
     for (const pull of payload.pulls) {
-      insertPull.run({
-        session_id: sessionId,
-        round_index: pull.roundIndex,
-        arm_index: pull.armIndex,
-        reward: pull.reward,
-        created_at: now,
-      })
+      await query(
+        'INSERT INTO pulls (session_id, round_index, arm_index, reward, created_at) VALUES ($1, $2, $3, $4, $5)',
+        [sessionId, pull.roundIndex, pull.armIndex, pull.reward, now],
+        client
+      )
     }
 
-    db.prepare('DELETE FROM metrics WHERE session_id = ?').run(sessionId)
-    insertMetrics.run({
-      session_id: sessionId,
-      total_reward: payload.metrics.totalReward,
-      average_reward: payload.metrics.averageReward,
-      best_arm_index: payload.metrics.bestArmIndex,
-      best_arm_mean: payload.metrics.bestArmMean,
-      expected_regret: payload.metrics.expectedRegret,
-      recency_weighted_accuracy: payload.metrics.recencyWeightedAccuracy,
-      perceived_average_error: payload.metrics.perceivedAverageError,
-      metrics_json: JSON.stringify(payload.metrics),
-      created_at: now,
-    })
-
-    upsertSessionHistory.run({
-      session_id: sessionId,
-      participant_id: settingsRow.participant_id,
-      snapshot_json: JSON.stringify({
+    await query('DELETE FROM metrics WHERE session_id = $1', [sessionId], client)
+    await query(
+      `INSERT INTO metrics (
+        session_id,
+        total_reward,
+        average_reward,
+        best_arm_index,
+        best_arm_mean,
+        expected_regret,
+        recency_weighted_accuracy,
+        perceived_average_error,
+        metrics_json,
+        created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
         sessionId,
-        participantId: settingsRow.participant_id,
-        createdAt: now,
-        runType: settingsRow.run_type,
-        settings,
-        pulls: payload.pulls,
-        metrics: payload.metrics,
-      }),
-      created_at: now,
-    })
+        payload.metrics.totalReward,
+        payload.metrics.averageReward,
+        payload.metrics.bestArmIndex,
+        payload.metrics.bestArmMean,
+        payload.metrics.expectedRegret,
+        payload.metrics.recencyWeightedAccuracy,
+        payload.metrics.perceivedAverageError,
+        JSON.stringify(payload.metrics),
+        now,
+      ],
+      client
+    )
+
+    await query(
+      `INSERT INTO session_history (session_id, participant_id, snapshot_json, created_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT(session_id) DO UPDATE SET
+         participant_id = excluded.participant_id,
+         snapshot_json = excluded.snapshot_json,
+         created_at = excluded.created_at`,
+      [
+        sessionId,
+        settingsRow.participant_id,
+        JSON.stringify({
+          sessionId,
+          participantId: settingsRow.participant_id,
+          createdAt: now,
+          runType: settingsRow.run_type,
+          settings,
+          pulls: payload.pulls,
+          metrics: payload.metrics,
+        }),
+        now,
+      ],
+      client
+    )
 
     if (settingsRow.run_type === 'final' && settingsRow.participant_id && settingsRow.experiment_id) {
-      upsertParticipantExperiment.run({
-        participant_id: settingsRow.participant_id,
-        experiment_id: settingsRow.experiment_id,
-        final_completed_at: now,
-        final_session_id: sessionId,
-        created_at: now,
-      })
+      await query(
+        `INSERT INTO participant_experiments (
+          participant_id,
+          experiment_id,
+          final_completed_at,
+          final_session_id,
+          created_at
+        ) VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT(participant_id, experiment_id) DO UPDATE SET
+          final_completed_at = excluded.final_completed_at,
+          final_session_id = excluded.final_session_id`,
+        [settingsRow.participant_id, settingsRow.experiment_id, now, sessionId, now],
+        client
+      )
 
-      db.prepare('UPDATE participants SET final_completed_at = ? WHERE participant_id = ?').run(now, settingsRow.participant_id)
+      await query(
+        'UPDATE participants SET final_completed_at = $1 WHERE participant_id = $2',
+        [now, settingsRow.participant_id],
+        client
+      )
     }
   })
-
-  saveTransaction()
 
   res.json({ ok: true, sessionId })
 })
 
-app.post('/api/sessions/:sessionId/abort', (req, res) => {
+app.post('/api/sessions/:sessionId/abort', async (req, res) => {
   const sessionId = String(req.params.sessionId)
   const participantId = normalizeParticipantId(req.body?.participantId)
 
-  const sessionRow = db
-    .prepare('SELECT id, participant_id, settings_json FROM sessions WHERE id = ?')
-    .get(sessionId) as { id: string; participant_id: string | null; settings_json: string } | undefined
+  const sessionResult = await query<{
+    id: string
+    participant_id: string | null
+    settings_json: string
+  }>('SELECT id, participant_id, settings_json FROM sessions WHERE id = $1', [sessionId])
+  const sessionRow = sessionResult.rows[0]
 
   if (!sessionRow) {
     res.status(404).json({ error: 'Session not found.' })
@@ -1319,9 +1316,10 @@ app.post('/api/sessions/:sessionId/abort', (req, res) => {
     return
   }
 
-  const metricsRow = db
-    .prepare('SELECT id FROM metrics WHERE session_id = ?')
-    .get(sessionId) as { id: number } | undefined
+  const metricsResult = await query<{ id: number }>('SELECT id FROM metrics WHERE session_id = $1', [
+    sessionId,
+  ])
+  const metricsRow = metricsResult.rows[0]
 
   if (metricsRow) {
     res.status(409).json({ error: 'Completed sessions cannot be aborted.' })
@@ -1334,15 +1332,22 @@ app.post('/api/sessions/:sessionId/abort', (req, res) => {
     return
   }
 
-  deleteSessionData(sessionId)
+  await deleteSessionData(sessionId)
 
   res.json({ ok: true, abortedSessionId: sessionId })
 })
 
 if (!process.env.VERCEL) {
-  app.listen(port, () => {
-    console.log(`Bandit API running on http://localhost:${port}`)
-  })
+  ensureDbInitialized()
+    .then(() => {
+      app.listen(port, () => {
+        console.log(`Bandit API running on http://localhost:${port}`)
+      })
+    })
+    .catch((error) => {
+      console.error('Failed to initialize database:', error)
+      process.exit(1)
+    })
 }
 
 export default app
