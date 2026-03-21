@@ -1224,17 +1224,21 @@ app.post('/api/sessions/:sessionId/complete', async (req, res) => {
   }
 
   const now = new Date().toISOString()
+  const roundIndexes = payload.pulls.map((pull) => pull.roundIndex)
+  const armIndexes = payload.pulls.map((pull) => pull.armIndex)
+  const rewards = payload.pulls.map((pull) => pull.reward)
 
   await withTransaction(async (client) => {
     await query('DELETE FROM pulls WHERE session_id = $1', [sessionId], client)
 
-    for (const pull of payload.pulls) {
-      await query(
-        'INSERT INTO pulls (session_id, round_index, arm_index, reward, created_at) VALUES ($1, $2, $3, $4, $5)',
-        [sessionId, pull.roundIndex, pull.armIndex, pull.reward, now],
-        client
-      )
-    }
+    await query(
+      `INSERT INTO pulls (session_id, round_index, arm_index, reward, created_at)
+       SELECT $1, pulls.round_index, pulls.arm_index, pulls.reward, $5
+       FROM unnest($2::int[], $3::int[], $4::double precision[])
+       AS pulls(round_index, arm_index, reward)`,
+      [sessionId, roundIndexes, armIndexes, rewards, now],
+      client
+    )
 
     await query('DELETE FROM metrics WHERE session_id = $1', [sessionId], client)
     await query(

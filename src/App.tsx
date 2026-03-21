@@ -554,23 +554,22 @@ function App() {
     setAdminMessage('')
 
     try {
-      const enabledExperimentIds = adminConfig.experiments
-        .filter((experiment) => experiment.enabled)
-        .map((experiment) => experiment.id)
+      const allExperimentIds = adminConfig.experiments.map((experiment) => experiment.id)
 
-      if (enabledExperimentIds.length === 0) {
-        throw new Error('No enabled experiments found to export.')
+      if (allExperimentIds.length === 0) {
+        throw new Error('No experiments found to export.')
       }
 
-      for (const experimentId of enabledExperimentIds) {
+      for (const experimentId of allExperimentIds) {
+        // Add timestamp cache buster for fresh downloads on re-export
         await downloadAdminCsv(
-          `/api/admin/export/experiment/${encodeURIComponent(experimentId)}`,
+          `/api/admin/export/experiment/${encodeURIComponent(experimentId)}?t=${Date.now()}`,
           `experiment_${experimentId}_pull_history.csv`
         )
       }
 
       setAdminMessage(
-        `Exported ${enabledExperimentIds.length} CSV file(s), one per experiment with A/B group labels included.`
+        `Exported ${allExperimentIds.length} CSV file(s), one per experiment with A/B group labels included.`
       )
     } catch (err) {
       setError(toUserErrorMessage(err, 'Failed to export CSV files'))

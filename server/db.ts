@@ -2,6 +2,7 @@ import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from 'pg
 
 const databaseUrl = process.env.DATABASE_URL
 const localDatabaseName = process.env.PGDATABASE ?? 'mini_game_theory'
+const isVercel = process.env.VERCEL === '1'
 
 function isHostedDatabase(url: string): boolean {
   const normalized = url.toLowerCase()
@@ -13,6 +14,11 @@ function createPool(targetDatabase?: string): Pool {
     return new Pool({
       connectionString: databaseUrl,
       ssl: isHostedDatabase(databaseUrl) ? { rejectUnauthorized: false } : undefined,
+      // Serverless-friendly defaults for pooled Neon connections.
+      max: Number(process.env.PGPOOL_MAX ?? (isVercel ? 3 : 10)),
+      idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS ?? 10_000),
+      connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS ?? 10_000),
+      allowExitOnIdle: true,
     })
   }
 
@@ -22,6 +28,10 @@ function createPool(targetDatabase?: string): Pool {
     database: targetDatabase ?? localDatabaseName,
     user: process.env.PGUSER ?? 'postgres',
     password: process.env.PGPASSWORD,
+    max: Number(process.env.PGPOOL_MAX ?? 10),
+    idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS ?? 10_000),
+    connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS ?? 10_000),
+    allowExitOnIdle: true,
   })
 }
 
@@ -175,6 +185,27 @@ async function initializeDb(): Promise<void> {
       created_at TEXT NOT NULL
     )
   `)
+
+  await query(
+    'CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at DESC)'
+  )
+  await query(
+    'CREATE INDEX IF NOT EXISTS idx_sessions_experiment_run_type ON sessions(experiment_id, run_type)'
+  )
+  await query('CREATE INDEX IF NOT EXISTS idx_sessions_ab_group ON sessions(ab_group)')
+  await query('CREATE INDEX IF NOT EXISTS idx_pulls_session_round ON pulls(session_id, round_index)')
+  await query('CREATE INDEX IF NOT EXISTS idx_metrics_session_id ON metrics(session_id)')
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_participant_experiments_participant_completed
+     ON participant_experiments(participant_id, final_completed_at)`
+  )
+  await query('CREATE INDEX IF NOT EXISTS idx_auth_otp_codes_expires_at ON auth_otp_codes(expires_at)')
+  await query(
+    'CREATE INDEX IF NOT EXISTS idx_auth_login_tokens_expires_at ON auth_login_tokens(expires_at)'
+  )
+  await query(
+    'CREATE INDEX IF NOT EXISTS idx_admin_auth_tokens_expires_at ON admin_auth_tokens(expires_at)'
+  )
 
   const defaultExperimentConfig = {
     title: 'Bandit Decision-Making Study',
