@@ -95,7 +95,7 @@ type CompletionPayload = {
 const app = express()
 const port = Number(process.env.PORT ?? 8787)
 const adminPassword = process.env.ADMIN_PASSWORD ?? 'change-me-now'
-const adminTokens = new Map<string, number>()
+const ADMIN_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
 
 const TEST_PARTICIPANT_ID = 'prateek@kriti'
 const TEST_OTP = '123456'
@@ -185,6 +185,15 @@ const selectLoginTokenByToken = db.prepare(
 )
 const deleteLoginTokenByToken = db.prepare('DELETE FROM auth_login_tokens WHERE token = ?')
 const deleteExpiredLoginTokens = db.prepare('DELETE FROM auth_login_tokens WHERE expires_at < ?')
+
+const insertAdminAuthToken = db.prepare(
+  'INSERT INTO admin_auth_tokens (token, expires_at, created_at) VALUES (?, ?, ?)'
+)
+const selectAdminAuthTokenByToken = db.prepare(
+  'SELECT token, expires_at FROM admin_auth_tokens WHERE token = ?'
+)
+const deleteAdminAuthTokenByToken = db.prepare('DELETE FROM admin_auth_tokens WHERE token = ?')
+const deleteExpiredAdminAuthTokens = db.prepare('DELETE FROM admin_auth_tokens WHERE expires_at < ?')
 
 const insertSession = db.prepare(
   `INSERT INTO sessions (
@@ -600,7 +609,20 @@ function validateExperimentConfig(config: ExperimentConfig): string | null {
 function requireAdminToken(req: express.Request, res: express.Response, next: express.NextFunction): void {
   const token = String(req.header('x-admin-token') ?? '')
 
-  if (!token || !adminTokens.has(token)) {
+  if (!token) {
+    res.status(401).json({ error: 'Unauthorized admin access.' })
+    return
+  }
+
+  deleteExpiredAdminAuthTokens.run(Date.now())
+  const row = selectAdminAuthTokenByToken.get(token) as
+    | { token: string; expires_at: number }
+    | undefined
+
+  if (!row || row.expires_at < Date.now()) {
+    if (row) {
+      deleteAdminAuthTokenByToken.run(token)
+    }
     res.status(401).json({ error: 'Unauthorized admin access.' })
     return
   }
@@ -772,7 +794,8 @@ app.post('/api/admin/login', (req, res) => {
   }
 
   const token = crypto.randomBytes(24).toString('hex')
-  adminTokens.set(token, Date.now())
+  deleteExpiredAdminAuthTokens.run(Date.now())
+  insertAdminAuthToken.run(token, Date.now() + ADMIN_TOKEN_TTL_MS, new Date().toISOString())
 
   res.json({ token })
 })
