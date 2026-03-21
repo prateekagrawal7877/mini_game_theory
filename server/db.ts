@@ -121,6 +121,12 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS admin_auth_tokens (
+    token TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `)
 
 const sessionColumns = db
