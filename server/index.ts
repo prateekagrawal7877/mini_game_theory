@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
-import db from './db'
+import db from './db.js'
 import crypto from 'node:crypto'
 import nodemailer from 'nodemailer'
 
