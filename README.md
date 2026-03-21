@@ -9,13 +9,13 @@ This project is a complete experiment workflow for a multi-armed bandit game:
 - Built-in A/B testing assignment with per-group visibility conditions
 - Post-game questionnaire to capture recall and perceived average for recency-bias analysis
 - Automatic metric calculation and on-screen display
-- Persistent storage in SQLite for future analysis
+- Persistent storage in PostgreSQL for future analysis
 
 ## Stack
 
 - Frontend: React + TypeScript + Vite
 - Backend API: Express + TypeScript
-- Database: SQLite (better-sqlite3)
+- Database: PostgreSQL (`pg`)
 
 ## Run Locally
 
@@ -32,6 +32,8 @@ ADMIN_PASSWORD="your-very-strong-password"
 OTP_SENDER_EMAIL="your-gmail-address@gmail.com"
 OTP_SENDER_PASSWORD="your-gmail-app-password"
 ALLOW_OTP_DELIVERY_FALLBACK="false"
+ENABLE_TEST_ACCOUNT="false"
+DATABASE_URL="postgres://username:password@localhost:5432/mini_game_theory"
 ```
 
 3. Start frontend + backend together:
@@ -99,19 +101,22 @@ Practice run results are shown but not treated as the counted final run.
 
 ## Database Storage
 
-SQLite file is created at:
-
-```text
-data/bandit_game.sqlite
-```
+PostgreSQL is required. The API auto-creates required tables at startup using the `DATABASE_URL` connection.
 
 Tables:
 
 - experiment_config
 - sessions
+- participants
+- participant_experiments
 - pulls
 - questionnaires
+- memory_recall_items
 - metrics
+- session_history
+- auth_otp_codes
+- auth_login_tokens
+- admin_auth_tokens
 
 This captures full session configuration, per-round pulls, questionnaire answers, and computed metrics for later analysis.
 
@@ -132,15 +137,50 @@ ADMIN_PASSWORD="your-very-strong-password"
 OTP_SENDER_EMAIL="your-gmail-address@gmail.com"
 OTP_SENDER_PASSWORD="your-gmail-app-password"
 ALLOW_OTP_DELIVERY_FALLBACK="false"
+DATABASE_URL="postgres://username:password@host:5432/database"
 ```
 
 3. Redeploy after adding environment variables.
 
 Notes:
 
-- `vercel.json` routes `/api/*` to the Express backend and serves the Vite frontend as static output.
-- On Vercel, the SQLite file is stored in `/tmp/data/bandit_game.sqlite`, which is writable but ephemeral.
-- For durable production data, move to a managed persistent database.
+- API routes are served from `api/[...path].ts` (Express app adapter for Vercel functions).
+- Use a hosted PostgreSQL database for both Preview and Production deploys.
+- In production, set `ENABLE_TEST_ACCOUNT=false` to disable tester OTP and unlimited final-trial bypass.
+
+### Preview Deploy (Step-by-step)
+
+1. Push your latest branch to GitHub (not `main`).
+2. In Vercel Dashboard, click **Add New... -> Project** and import this repository.
+3. In **Build and Output Settings**, set:
+
+```text
+Framework Preset: Vite
+Install Command: npm install
+Build Command: npm run check:deploy
+Output Directory: dist
+```
+
+4. In **Environment Variables**, add all four variables and set the **Environment** selector to include **Preview**:
+
+```text
+ADMIN_PASSWORD
+OTP_SENDER_EMAIL
+OTP_SENDER_PASSWORD
+ALLOW_OTP_DELIVERY_FALLBACK=false
+ENABLE_TEST_ACCOUNT=false
+DATABASE_URL=postgres://username:password@host:5432/database
+```
+
+5. Click **Deploy**.
+6. For all future preview updates, push commits to the same branch; Vercel will auto-generate/update a Preview URL.
+7. Verify Preview URL endpoints:
+
+```text
+/
+/api/health
+/api/participant/experiment
+```
 
 ## Notes for Future Metric Customization
 
