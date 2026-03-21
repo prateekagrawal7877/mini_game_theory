@@ -1019,7 +1019,8 @@ app.post('/api/sessions/start', async (req, res) => {
 
   const config = await getExperimentConfig()
 
-  const selectedExperiment =
+  const enabledExperiments = config.experiments.filter((experiment) => experiment.enabled)
+  let selectedExperiment =
     runType === 'practice' ? null : pickExperiment(config, requestedExperimentId)
 
   if (runType === 'final' && !selectedExperiment) {
@@ -1059,6 +1060,29 @@ app.post('/api/sessions/start', async (req, res) => {
       return
     }
 
+    const completedExperimentRows = await query<{ experiment_id: string | null }>(
+      `SELECT experiment_id
+       FROM participant_experiments
+       WHERE participant_id = $1 AND final_completed_at IS NOT NULL`,
+      [participantId]
+    )
+    const completedExperimentIds = new Set(
+      completedExperimentRows.rows
+        .map((row) => row.experiment_id)
+        .filter((value): value is string => Boolean(value))
+    )
+    const remainingEnabledExperiments = enabledExperiments.filter(
+      (experiment) => !completedExperimentIds.has(experiment.id)
+    )
+
+    if (remainingEnabledExperiments.length === 0) {
+      res.status(409).json({
+        error:
+          'This participant has reached the maximum allowed number of completed final experiments.',
+      })
+      return
+    }
+
     const existingFinalResult = await query<{ final_completed_at: string | null }>(
       'SELECT final_completed_at FROM participant_experiments WHERE participant_id = $1 AND experiment_id = $2',
       [participantId, selectedExperiment?.id ?? null]
@@ -1066,10 +1090,7 @@ app.post('/api/sessions/start', async (req, res) => {
     const existingFinalForExperiment = existingFinalResult.rows[0]
 
     if (existingFinalForExperiment?.final_completed_at) {
-      res.status(409).json({
-        error: `Final run for ${selectedExperiment?.label ?? 'this experiment'} is already completed for this participant.`,
-      })
-      return
+      selectedExperiment = remainingEnabledExperiments[0]
     }
   }
 
