@@ -620,6 +620,16 @@ function App() {
       setActiveExperimentLabel(data.settings.experimentLabel)
       setBanditMeans(data.banditMeans)
       setRunType(data.runType)
+
+      if (nextRunType === 'final' && sequenceExperiments.length > 0) {
+        const resolvedIndex = sequenceExperiments.findIndex(
+          (candidate) => candidate.id === data.experiment.id
+        )
+        if (resolvedIndex >= 0) {
+          setSequenceIndex(resolvedIndex)
+        }
+      }
+
       setPulls([])
       setPullInProgress(false)
       setActiveArmIndex(null)
@@ -681,7 +691,6 @@ function App() {
       return
     }
 
-    const targetIndex = pendingNextIndex
     const started = await startSingleSession('final', activeParticipantId, nextExperiment)
     if (!started) {
       return
@@ -689,7 +698,6 @@ function App() {
 
     setPendingNextIndex(null)
     setJustCompletedExperimentLabel('')
-    setSequenceIndex(targetIndex)
   }
 
   function clearPendingTimers() {
