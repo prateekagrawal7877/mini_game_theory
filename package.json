@@ -8,6 +8,8 @@
     "dev:web": "vite",
     "dev:api": "tsx watch server/index.ts",
     "build": "tsc -b && vite build",
+    "check:server": "tsc -p tsconfig.server.json",
+    "check:deploy": "npm run check:server && npm run build",
     "lint": "eslint .",
     "preview": "vite preview",
     "start:api": "tsx server/index.ts"
